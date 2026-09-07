@@ -1,0 +1,3 @@
+[submodule "external/genesis-world"]
+	path = external/genesis-world
+	url = https://github.com/Genesis-Embodied-AI/genesis-world.git
