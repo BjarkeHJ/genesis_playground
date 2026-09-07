@@ -1,0 +1,91 @@
+<?xml version="1.0"?>
+<robot name="payload">
+
+  <properties> 
+    mass="{{ mass }}" 
+    size_x="{{ size_x }}" 
+    size_y="{{ size_y }}" 
+    size_z="{{ size_z }}"
+    drag_coeff_x="{{ drag_coeff_x }}" 
+    drag_coeff_y="{{ drag_coeff_y }}" 
+    drag_coeff_z="{{ drag_coeff_z }}"
+    attachment_points="{{ attachment_points }}"
+  </properties>
+
+  <material name="payload_body">
+    <color rgba="{{ body_color }}"/>
+  </material>
+  <material name="payload_panel">
+    <color rgba="{{ panel_color }}"/>
+  </material>
+  <material name="payload_arrow">
+    <color rgba="{{ arrow_color }}"/>
+  </material>
+
+  <link name="payload">
+
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="{{ mass }}"/>
+      <inertia ixx="{{ ixx }}" ixy="0" ixz="0" iyy="{{ iyy }}" iyz="0" izz="{{ izz }}"/>
+    </inertial>
+
+    <visual name="body_visual">
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="{{ size_x }} {{ size_y }} {{ size_z }}"/>
+      </geometry>
+      <material name="payload_body"/>
+    </visual>
+
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="{{ size_x }} {{ size_y }} {{ size_z }}"/>
+      </geometry>
+    </collision>
+
+    <!-- Top panel: background plate for the direction arrow -->
+    <visual name="top_panel_visual">
+      <origin xyz="0 0 {{ size_z / 2 + top_panel_thickness / 2 }}" rpy="0 0 0"/>
+      <geometry>
+        <box size="{{ size_x }} {{ size_y }} {{ top_panel_thickness }}"/>
+      </geometry>
+      <material name="payload_panel"/>
+    </visual>
+
+    <!-- Arrow shaft, pointing toward +x -->
+    <visual name="arrow_shaft_visual">
+      <origin xyz="{{ -arrow_head_size / 2 }} 0 {{ size_z / 2 + top_panel_thickness + arrow_height / 2 }}" rpy="0 0 0"/>
+      <geometry>
+        <box size="{{ arrow_shaft_len }} {{ arrow_shaft_width }} {{ arrow_height }}"/>
+      </geometry>
+      <material name="payload_arrow"/>
+    </visual>
+
+    <!-- Arrow head: square box rotated 45 deg into a diamond, tip pointing toward +x -->
+    <visual name="arrow_head_visual">
+      <origin xyz="{{ arrow_length / 2 - arrow_head_size / 2 }} 0 {{ size_z / 2 + top_panel_thickness + arrow_height / 2 }}" rpy="0 0 0.785398"/>
+      <geometry>
+        <box size="{{ arrow_head_size }} {{ arrow_head_size }} {{ arrow_height }}"/>
+      </geometry>
+      <material name="payload_arrow"/>
+    </visual>
+
+  </link>
+
+  {% for x, y in attachment_points %}
+  <link name="attach_{{ loop.index0 }}">
+    <visual>
+      <geometry><sphere radius="0.01"/></geometry>
+      <material name="payload_planel"/>
+    </visual>
+  </link>
+  <joint name="attach_{{ loop.index0 }}_joint" type="fixed">
+    <parent link="payload"/>
+    <child link="attach_{{ loop.index0 }}"/>
+    <origin xyz="{{ x }} {{ y }} {{ size_z / 2}}" rpy="0 0 0"/>
+  </joint>
+  {% endfor %}
+
+</robot>
