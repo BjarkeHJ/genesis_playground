@@ -40,7 +40,7 @@ drone_link = drone.get_link("base_link")
 # Build the scene with all entities (compiles kernels, visualizers etc.)
 scene.build(n_envs=1)
 
-hover_rpm = 50000
+hover_rpm = 15138
 
 for i in range(10000):
     drone.set_propellers_rpm([hover_rpm, hover_rpm, hover_rpm, hover_rpm])
