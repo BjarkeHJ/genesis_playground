@@ -1,3 +1,6 @@
 [submodule "external/genesis-world"]
 	path = external/genesis-world
 	url = https://github.com/Genesis-Embodied-AI/genesis-world.git
+[submodule "external/models/Starling2MaxURDF"]
+	path = external/models/Starling2MaxURDF
+	url = https://github.com/BjarkeHJ/Starling2MaxURDF.git

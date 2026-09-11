@@ -4,14 +4,11 @@ import torch
 
 _EPS = 1e-9
 
-
 def _rotate_vector_by_quat(v: torch.Tensor, quat: torch.Tensor) -> torch.Tensor:
-    """Rotate `v` by the unit quaternion `quat` (w, x, y, z), broadcasting over leading dims."""
     q_w = quat[..., 0:1]
     q_vec = quat[..., 1:4]
     t = 2.0 * torch.cross(q_vec, v, dim=-1)
     return v + q_w * t + torch.cross(q_vec, t, dim=-1)
-
 
 def attach_point_kinematics(
     link_pos: torch.Tensor,
@@ -25,39 +22,46 @@ def attach_point_kinematics(
     vel = link_vel.unsqueeze(1) + torch.cross(link_ang.unsqueeze(1), r, dim=-1)
     return pos, vel
 
-
 class CableWrench(NamedTuple):
     drone_force: torch.Tensor  # [n_envs, num_cables, 3], world frame
     payload_force: torch.Tensor  # [n_envs, num_cables, 3], world frame
     tension: torch.Tensor  # [n_envs, num_cables]
 
-
 # Model the tether forces between drone and payload.
-# Modelled as independent unilateral spring-damper systems
+# Modelled as independent unilateral spring-damper systems.
+# All cables are assumed identical, so per-cable parameters are scalars
+# that broadcast over the cable dimension instead of being stacked/repeated.
 class TetherModel:
-    """
-    Unilateral spring-damper force law for `num_cables` independent tether cables, each connecting
-    a world-frame attach point on the drone to one on the payload.
-    """
-
-    def __init__(self, cable_cfg: dict, num_envs: int, device: torch.device, dtype: torch.dtype = torch.float32):
+    def __init__(
+        self,
+        cable_cfg: dict,
+        num_envs: int,
+        dt: float,
+        drone_mass: torch.Tensor,
+        payload_mass: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+    ):
         self.num_envs = num_envs
         self.device = device
-        self.num_cables = len(cable_cfg["cables"])
+        self.dt = dt
 
-        def stacked_scalar(key: str) -> torch.Tensor:
-            return torch.tensor([c[key] for c in cable_cfg["cables"]], dtype=dtype, device=device).reshape(
-                1, self.num_cables
-            )
+        self.m_eff = (1.0 / (1.0 / drone_mass + 1.0 / payload_mass)).reshape(num_envs, 1)
 
-        self.stiffness = stacked_scalar("stiffness")
-        self.damping = stacked_scalar("damping")
-        self.rest_length = stacked_scalar("rest_length")
-        self.cable_diameter = stacked_scalar("cable_diameter")
+        def scalar(key: str) -> torch.Tensor:
+            return torch.tensor(cable_cfg[key], dtype=dtype, device=device)
 
-        slack_transition_width = stacked_scalar("slack_transition_width")
+        # Cable model parameters
+        self.stiffness = scalar("stiffness")
+        self.damping = scalar("damping")
+        self.rest_length = scalar("rest_length")
+        self.cable_diameter = scalar("cable_diameter")
+
+        # Non-linearities near slack-taut boundry
+        slack_transition_width = scalar("slack_transition_width")
         self.activation_delta = torch.clamp(slack_transition_width * self.rest_length, min=_EPS)
 
+        # Aerodynamic parameters
         self.air_density = 1.225  # [kg/m^3], sea level
         self.cylinder_drag_coeff = 1.2  # cylinder in subcritical crossflow
 
@@ -75,7 +79,12 @@ class TetherModel:
         extension = length - self.rest_length
         activation = 0.5 * (1.0 + torch.tanh(extension / self.activation_delta))
         extension_rate = ((payload_vel - drone_vel) * uhat).sum(dim=-1)
-        tension = activation * (self.stiffness * extension + self.damping * extension_rate)
+
+        # Backward-Euler step of the linear spring-damper law: solves for the end-of-step extension rate
+        # consistent with the held force, instead of evaluating it at the (explicit) start-of-step state.
+        damping_implicit = self.damping + self.dt * self.stiffness
+        extension_rate_implicit = (self.m_eff * extension_rate - self.dt * self.stiffness * extension) / (self.m_eff + self.dt * damping_implicit)
+        tension = activation * (self.stiffness * extension + damping_implicit * extension_rate_implicit)
         tension = torch.clamp(tension, min=0.0)
 
         force_on_payload = -tension.unsqueeze(-1) * uhat

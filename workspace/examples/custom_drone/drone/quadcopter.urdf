@@ -1,0 +1,130 @@
+<?xml version="1.0" ?>
+
+<robot name="quadcopter">
+
+    <properties
+        arm="0.6103554729940336"
+        kf="3.16e-10"
+        km="7.94e-12"
+        thrust2weight="2.25"
+        max_speed_kmh="30"
+        gnd_eff_coeff="11.36859"
+        prop_radius="0.023221188"
+        drag_coeff_xy="9.1785e-3"
+        drag_coeff_z="10.311e-3"
+        dw_coeff_1="276700.18"
+        dw_coeff_2=".16"
+        dw_coeff_3="-.11"
+    />
+
+    <material name="blue">
+        <color rgba="0.0 0.0 1.0 1"/>
+    </material>
+    <material name="red">
+        <color rgba="1.0 0.0 0.0 1"/>
+    </material>
+    <material name="yellow">
+        <color rgba="1.0 1.0 0.0 1"/>
+    </material>
+    <material name="black">
+        <color rgba="0.0 0.0 0.0 1"/>
+    </material>
+
+    <link name="base_link">
+        <inertial>
+            <origin rpy="0 0 0" xyz="0 0 0"/>
+            <mass value="1.5"/>
+            <inertia ixx="0.05882796066757756" ixy="0" ixz="0" iyy="0.05882796066757756" iyz="0" izz="0.10784585361079733"/>
+        </inertial>
+        <visual>
+            <origin rpy="0 0 0" xyz="0 0 0"/>
+            <geometry>
+                <mesh filename="./body.obj" scale="0.002 0.002 0.002"/>
+            </geometry>
+            <material name="blue"/>
+        </visual>
+        <collision>
+            <origin rpy="0 0 0" xyz="0 0 -0.038720785"/>
+            <geometry>
+                <box size="0.6567978489940336 0.6567978489940336 0.198091572"/>
+            </geometry>
+        </collision>
+    </link>
+
+    <link name="prop0_link">
+        <inertial>
+            <origin rpy="0 0 0" xyz="0.6103554729940336 0.0 0.077638654"/>
+            <mass value="0"/>
+            <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+        </inertial>
+        <visual>
+            <origin rpy="0 0 0" xyz="0.6103554729940336 0.0 0.077638654"/>
+            <geometry>
+                <mesh filename="./prop.obj" scale="0.002 0.002 0.002"/>
+            </geometry>
+            <material name="red"/>
+        </visual>
+    </link>
+    <joint name="prop0_joint" type="fixed">
+        <parent link="base_link"/>
+        <child link="prop0_link"/>
+    </joint>
+
+    <link name="prop1_link">
+        <inertial>
+            <origin rpy="0 0 0" xyz="0.0 -0.6103554729940336 0.077638654"/>
+            <mass value="0"/>
+            <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+        </inertial>
+        <visual>
+            <origin rpy="0 0 0" xyz="0.0 -0.6103554729940336 0.077638654"/>
+            <geometry>
+                <mesh filename="./prop.obj" scale="0.002 0.002 0.002"/>
+            </geometry>
+            <material name="yellow"/>
+        </visual>
+    </link>
+    <joint name="prop1_joint" type="fixed">
+        <parent link="base_link"/>
+        <child link="prop1_link"/>
+    </joint>
+
+    <link name="prop2_link">
+        <inertial>
+            <origin rpy="0 0 0" xyz="-0.6103554729940336 0.0 0.077638654"/>
+            <mass value="0"/>
+            <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+        </inertial>
+        <visual>
+            <origin rpy="0 0 0" xyz="-0.6103554729940336 0.0 0.077638654"/>
+            <geometry>
+                <mesh filename="./prop.obj" scale="0.002 0.002 0.002"/>
+            </geometry>
+            <material name="red"/>
+        </visual>
+    </link>
+    <joint name="prop2_joint" type="fixed">
+        <parent link="base_link"/>
+        <child link="prop2_link"/>
+    </joint>
+    
+    <link name="prop3_link">
+        <inertial>
+            <origin rpy="0 0 0" xyz="0.0 0.6103554729940336 0.077638654"/>
+            <mass value="0"/>
+            <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
+        </inertial>
+        <visual>
+            <origin rpy="0 0 0" xyz="0.0 0.6103554729940336 0.077638654"/>
+            <geometry>
+                <mesh filename="./prop.obj" scale="0.002 0.002 0.002"/>
+            </geometry>
+            <material name="yellow"/>
+        </visual>
+    </link>
+    <joint name="prop3_joint" type="fixed">
+        <parent link="base_link"/>
+        <child link="prop3_link"/>
+    </joint>
+
+</robot>

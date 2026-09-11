@@ -6,9 +6,10 @@ import os
 import cable as cable
 
 class DronePayloadEnv:
-    def __init__(self, num_envs: int, env_cfg: dict, obs_cfg: dict, reward_cfg: dict, target_cfg: dict, show_viever: bool=False, device: str="cuda"):
+    def __init__(self, num_envs: int, env_cfg: dict, obs_cfg: dict, reward_cfg: dict, target_cfg: dict, show_viewer: bool=False, device: str="cuda"):
         self.device = torch.device(device)
         self.num_envs = num_envs
+        self.show_viewer = show_viewer
 
         # self.dim_obs = obs_cfg["dim_obs"] # dimension of observer vector (drone/payload/world observed state)
         # self.dim_actions = env_cfg["dim_actions"] # dimension of action vector (output dimension of policy - fed to FC)
@@ -26,22 +27,22 @@ class DronePayloadEnv:
 
         # Genesis-World Scene
         self.scene = gs.Scene(
-            sim_options=gs.options.SimOptions(dt=self.dt),
+            sim_options=gs.options.SimOptions(dt=self.dt), # physics rate
+
             viewer_options=gs.options.ViewerOptions(
-                # max_FPS=env_cfg["max_visualize_FPS"],
                 camera_pos=(0.0, 7.0, 3.0),
                 camera_lookat=(0.0, 0.0, 2.0),
                 camera_fov=40,
-            ),
+            ), # viewer (default 60 fps update rate)
             vis_options=gs.options.VisOptions(rendered_envs_idx=list(range(1)),
-                                              background_color=(0.9, 0.9, 0.9)),
+                                              background_color=(0.2, 0.2, 0.2)), # scene visual settings
             rigid_options=gs.options.RigidOptions(
                 dt=self.dt,
                 constraint_solver=gs.constraint_solver.Newton,
                 enable_collision=True,
                 enable_joint_limit=False,
-            ),
-            show_viewer=show_viever,
+            ), # rigid solver settings
+            show_viewer=show_viewer, # visualiser on/off
         )
 
         # World ground plane surface
@@ -66,27 +67,32 @@ class DronePayloadEnv:
             ),
         )
 
-        script_dir = os.path.dirname(os.path.realpath(__file__))
-
         # Payload
+        payload_links = [f"attach_{x}" for x in range(3)]
+        script_dir = os.path.dirname(os.path.realpath(__file__))
         self.payload = self.scene.add_entity(
             gs.morphs.URDF(
                 file=script_dir + "/payload/payload.urdf",
                 pos=(1,0,0.5),
                 euler=(0,0,0),
                 scale=(1,1,1),
-                links_to_keep=["attach_0", "attach_1", "attach_2"],
+                links_to_keep=payload_links,
             ),
         )
 
+        # Build scene
         self.scene.build(n_envs=num_envs)
 
-        # Drone base_link + Payload attachment links
+        # Drone base_link
         self.drone_link = self.drone.get_link("base_link")
-        self.payload_attach_links = [self.payload.get_link(f"attach_{i}") for i in range(3)]
+
+        # Payload attachment point links
+        self.payload_attach_links = [self.payload.get_link(link) for link in payload_links]
         self.payload_attach_links_idx = [link.idx_local for link in self.payload_attach_links]
 
-        drone_attach_radius = 0.1  # m, within the base_link's 0.06 m collision radius
+        # TEMPORARY: Define drone attachment points
+        # TODO: Move to link-based urdf approach (like payload)
+        drone_attach_radius = 0.05  # m, equilateral triangle center-to-vertex dist
         drone_attach_z_offset = -0.02  # m, below the body center
         num_cables = len(self.payload_attach_links)
         drone_attach_offsets = [
@@ -97,27 +103,37 @@ class DronePayloadEnv:
             ]
             for i in range(num_cables)
         ]
-        self.drone_attach = torch.tensor(
-            drone_attach_offsets, dtype=gs.tc_float, device=self.device
-        ).unsqueeze(0)
+        self.drone_attach = torch.tensor(drone_attach_offsets, dtype=gs.tc_float, device=self.device).unsqueeze(0)
 
-        cable_cfg = {
-            "cables": [
-                {
-                    "stiffness": 2000.0,
-                    "damping": 100.0,
-                    "rest_length": 3,
-                    "slack_transition_width": 0.01,
-                    "cable_diameter": 0.01,
-                }
-                for _ in self.payload_attach_links
-            ],
-        }
-        self.cable = cable.TetherModel(cable_cfg, num_envs=num_envs, device=self.device, dtype=gs.tc_float)
-        self.num_cables = self.cable.num_cables
-        self.drone_link_idx_repeated = [self.drone_link.idx_local] * self.num_cables
-
+        # Masses        
         drone_mass = self.drone.get_mass()
+        payload_mass = self.payload.get_mass()
+
+        # N identical cables
+        cable_cfg = {
+            "num_cables": 3,
+            "stiffness": 5000.0,
+            "damping": 100.0,
+            "rest_length": 7,
+            "slack_transition_width": 0.01,
+            "cable_diameter": 0.01,
+        }
+
+        # Initialize the TetherModel
+        self.cable = cable.TetherModel(
+            cable_cfg,
+            num_envs=num_envs,
+            dt=self.dt,
+            drone_mass=drone_mass,
+            payload_mass=payload_mass,
+            device=self.device,
+            dtype=gs.tc_float,
+        )
+
+        # Cables applies forces/torques to the same link but at differen offsets
+        self.drone_link_idx_repeated = [self.drone_link.idx_local] * cable_cfg["num_cables"]
+
+        # Temporary actions just to get props spinning
         hover_thrust_per_rotor = drone_mass * 9.81 / self.drone.n_propellers
         self.hover_rpm = torch.sqrt(hover_thrust_per_rotor / self.drone.KF) * 1.05
 
@@ -129,19 +145,24 @@ class DronePayloadEnv:
         actions = torch.clamp(actions, -1.0, 1.0)
         propellers_rpm = (1.0 + actions * 0.8) * self.hover_rpm.unsqueeze(-1)
         self.drone.set_propellers_rpm(propellers_rpm)
-        
+
+        # Drone attach point kinematics (TEMPORARY)
+        # TODO: When drone URDF has explicit attach point links just get the kinematics from the simulator
         drone_link_pos = self.drone_link.get_pos(relative=False)
         drone_link_quat = self.drone_link.get_quat(relative=False)
         drone_link_vel = self.drone_link.get_vel()
         drone_link_ang = self.drone_link.get_ang()
-
         drone_pos, drone_vel = cable.attach_point_kinematics(drone_link_pos, drone_link_quat, drone_link_vel, drone_link_ang, self.drone_attach)
 
+        # Payload attach point kinematics (payload has links for attach points)
         payload_pos = self.payload.get_links_pos(self.payload_attach_links_idx, relative=False)
         payload_vel = self.payload.get_links_vel(self.payload_attach_links_idx)
 
+        # Compute the wrench applied by the cables via the TetherModel (backward implicit euler)
         wrench = self.cable.compute(drone_pos, drone_vel, payload_pos, payload_vel)
-        self.cable_wrench = wrench  # stashed for reward/obs (e.g. _reward_swing, tension penalty)
+
+        # stashed for reward/obs (e.g. _reward_swing, tension penalty)
+        self.cable_wrench = wrench  
 
         self.drone.apply_links_external_wrench(wrench.drone_force, links_idx_local=self.drone_link_idx_repeated, pos=drone_pos)
         self.payload.apply_links_external_wrench(wrench.payload_force, links_idx_local=self.payload_attach_links_idx)
