@@ -4,3 +4,6 @@
 [submodule "external/models/Starling2MaxURDF"]
 	path = external/models/Starling2MaxURDF
 	url = https://github.com/BjarkeHJ/Starling2MaxURDF.git
+[submodule "system_model/Starling2MaxURDF"]
+	path = system_model/Starling2MaxURDF
+	url = https://github.com/BjarkeHJ/Starling2MaxURDF.git

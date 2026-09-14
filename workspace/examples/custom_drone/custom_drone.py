@@ -5,7 +5,8 @@ import numpy as np
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", ".."))
-MODEL_PATH = os.path.join(REPO_ROOT, "external", "models", "Starling2MaxURDF", "model", "starling2max.urdf")
+MODEL_PATH = os.path.join(REPO_ROOT, "system_model", "Starling2MaxURDF", "model", "starling2max.urdf")
+PAYLOAD_PATH = os.path.join(REPO_ROOT, "system_model", "payload", "box", "box.urdf")
 
 # Init scene - MUST be the first thing done
 gs.init(backend=gs.cpu)
@@ -32,7 +33,9 @@ drone = scene.add_entity(
         euler=(0.0, 0.0, 0.0),  # scipy extrinsic x-y-z, degrees
         propellers_link_name=("prop0_link", "prop1_link", "prop2_link", "prop3_link"),
         propellers_spin=(-1, 1, -1, 1),  # per propeller: -1 = CW, +1 = CCW
+        prioritize_urdf_material=True,
     ),
+    # surface=gs.surfaces.Plastic(color=(0.1, 0.1, 0.1, 1.0)),
 )
 
 drone_link = drone.get_link("base_link")

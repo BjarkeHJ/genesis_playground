@@ -6,7 +6,7 @@ import math
 
 TEMPLATE_DIR = Path(__file__).resolve().parent
 
-def generate(mass=1.0, size=(0.3, 0.3, 0.1), output="payload.urdf",
+def generate(mass=1.0, size=(0.3, 0.3, 0.1), output="box.urdf",
              body_color=(0.0, 0.0, 0.8, 1.0),
              panel_color=(0.9, 0.0, 0.0, 1.0),
              arrow_color=(0.05, 0.85, 0.05, 1.0)):
@@ -36,7 +36,7 @@ def generate(mass=1.0, size=(0.3, 0.3, 0.1), output="payload.urdf",
     env = Environment(loader=FileSystemLoader(str(TEMPLATE_DIR)),
                       trim_blocks=True, lstrip_blocks=True)
 
-    urdf = env.get_template("payload.urdf.j2").render(
+    urdf = env.get_template("box.urdf.j2").render(
         mass=mass, size_x=size_x, size_y=size_y, size_z=size_z,
         ixx=ixx, iyy=iyy, izz=izz,
         top_panel_thickness=top_panel_thickness,
@@ -77,16 +77,16 @@ def compute_attachment_points(size, delta0 = 0):
 
 def main():
     p = argparse.ArgumentParser(
-        description="Generate Payload URDF",
+        description="Generate Payload Box URDF",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
 
-    p.add_argument("--mass", type=float, default=1.0, help="Payload mass [kg]")
-    p.add_argument("--size", type=float, nargs=3, default=(0.3,0.3,0.1), metavar=("X", "Y", "Z"), help="Box size ([m],[m],[m])")
+    p.add_argument("--mass", type=float, default=0.4, help="Payload mass [kg]")
+    p.add_argument("--size", type=float, nargs=3, default=(0.2,0.2,0.05), metavar=("X", "Y", "Z"), help="Box size ([m],[m],[m])")
     p.add_argument("--body-color", type=float, nargs=4, default=(0.0, 0.0, 0.8, 1.0), metavar=("R", "G", "B", "A"), help="Box body RGBA color")
     p.add_argument("--panel-color", type=float, nargs=4, default=(0.9, 0.0, 0.0, 1.0), metavar=("R", "G", "B", "A"), help="Top panel RGBA color")
     p.add_argument("--arrow-color", type=float, nargs=4, default=(0.05, 0.85, 0.05, 1.0), metavar=("R", "G", "B", "A"), help="Direction arrow RGBA color")
-    p.add_argument("-o", "--output", type=str, default="payload.urdf")
+    p.add_argument("-o", "--output", type=str, default="box.urdf")
 
     args = p.parse_args()
 
