@@ -7,3 +7,6 @@
 [submodule "system_model/Starling2MaxURDF"]
 	path = system_model/Starling2MaxURDF
 	url = https://github.com/BjarkeHJ/Starling2MaxURDF.git
+[submodule "external/rsl_rl"]
+	path = external/rsl_rl
+	url = https://github.com/leggedrobotics/rsl_rl.git
