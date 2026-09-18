@@ -261,9 +261,11 @@ class SlungPayloadEnv:
         # Check termination conditions
         payload_tilt = self._tilt_from_vertical(self.payload_quat)
         drone_tilt = self._tilt_from_vertical(self.drone_base_link_quat)
+        swing_angle = self._swing_angle_deg()
         self.crash_condition = (
             (torch.abs(payload_tilt[:, 0]) > self.env_cfg.terminate_if_roll_greater_than)
             | (torch.abs(payload_tilt[:, 1]) > self.env_cfg.terminate_if_pitch_greater_than)
+            | (swing_angle > self.env_cfg.terminate_if_swing_angle_greater_than)
             | (torch.abs(drone_tilt[:, 0]) >= 90.0)
             | (torch.abs(drone_tilt[:, 1]) >= 90.0)
             | (torch.abs(self.payload_pos_err[:, 0]) > self.env_cfg.terminate_if_x_greater_than)
@@ -348,13 +350,25 @@ class SlungPayloadEnv:
         pitch = torch.rad2deg(torch.atan2(up[:, 0], up[:, 2]))
         return torch.stack([roll, pitch], dim=1)
 
+    def _swing_angle_deg(self) -> torch.Tensor:
+        # Angle of the drone-payload line from vertical (0 = payload hanging straight below the drone)
+        rel_pos_xy = torch.norm(self.drone_payload_relative_pos[:, :2], dim=1)
+        rel_pos_z = self.drone_payload_relative_pos[:, 2]
+        return torch.rad2deg(torch.atan2(rel_pos_xy, rel_pos_z))
+
     def _at_target(self):
         return (torch.norm(self.payload_pos_err, dim=1) < self.env_cfg.at_target_th).nonzero(as_tuple=False).reshape((-1,))
-    
+
     def _get_resample_idxs(self):
+        # Only count as "at target" once the swing has also settled -- otherwise the next
+        # waypoint gets issued while the payload is still oscillating from the last one.
+        settled = (
+            (torch.norm(self.payload_pos_err, dim=1) < self.env_cfg.at_target_th)
+            & (torch.norm(self.drone_payload_relative_vel[:, :2], dim=1) < self.env_cfg.at_target_swing_vel_th)
+        )
         self.at_target_buf = torch.where(
-            torch.norm(self.payload_pos_err, dim=1) < self.env_cfg.at_target_th,
-            self.at_target_buf + 1, 
+            settled,
+            self.at_target_buf + 1,
             torch.zeros_like(self.at_target_buf)
         )
 
@@ -390,24 +404,37 @@ class SlungPayloadEnv:
 
         dist_z_last  = torch.abs(self.payload_last_pos_err[:, 2])
         dist_xy_last = torch.norm(self.payload_last_pos_err[:, :2], dim=1)
-        target_rew += 2.0 * (dist_z_last - dist_z) + (dist_xy_last - dist_xy)
+        progress_cap = self.reward_cfg.max_close_rate * self.dt # cap rewarded closing speed -- otherwise reward is unbounded in dash speed
+        progress_z  = torch.clamp(dist_z_last - dist_z,   -progress_cap, progress_cap)
+        progress_xy = torch.clamp(dist_xy_last - dist_xy, -progress_cap, progress_cap)
+        target_rew += 2.0 * progress_z + progress_xy
         return target_rew
 
-    def _reward_motion(self):
-        motion_rew = 0.0
-
-        payload_acc = (self.payload_lin_vel - self.payload_last_lin_vel) / self.dt
+    def _reward_swing_pos(self):
+        # Penalize lateral drone-payload offset (pendulum displacement)
         rel_pos_xy = self.drone_payload_relative_pos[:, :2]
-        rel_vel_xy = self.drone_payload_relative_vel[:, :2]
+        return -torch.sum(rel_pos_xy * rel_pos_xy, dim=1)
 
+    def _reward_swing_vel(self):
+        # Penalize lateral drone-payload relative velocity (pendulum rate)
+        rel_vel_xy = self.drone_payload_relative_vel[:, :2]
+        return -torch.sum(rel_vel_xy * rel_vel_xy, dim=1)
+
+    def _reward_swing_angle(self):
+        # Penalize tether angle from vertical directly (normalized to [0,1] at 90deg)
+        swing_angle_rad = torch.deg2rad(self._swing_angle_deg())
+        return -(swing_angle_rad * swing_angle_rad)
+
+    def _reward_smooth_accel(self):
+        # Penalize payload jerk/acceleration
+        payload_acc = (self.payload_lin_vel - self.payload_last_lin_vel) / self.dt
+        return -torch.sum(payload_acc * payload_acc, dim=1)
+
+    def _reward_vel_damp(self):
+        # Penalize residual payload velocity once close to target -- require settling, not just arriving
         close_gate = torch.exp(-torch.norm(self.payload_pos_err, dim=1) / self.reward_cfg.sigma_target)
         vel_err = self.payload_lin_vel
-        
-        motion_rew -= torch.sum(payload_acc * payload_acc, dim=1)
-        motion_rew -= torch.sum(rel_pos_xy * rel_pos_xy, dim=1)
-        motion_rew -= torch.sum(rel_vel_xy * rel_vel_xy, dim=1)
-        motion_rew -= close_gate * torch.sum(vel_err * vel_err, dim=1) 
-        return motion_rew
+        return -close_gate * torch.sum(vel_err * vel_err, dim=1)
 
     def _reward_tension(self):
         dist_drone_pl = torch.norm(self.drone_payload_relative_pos, dim=1)
@@ -432,11 +459,15 @@ class SlungPayloadEnv:
     def _compute_reward(self):
         self.rew_buf[:] = (
               self.reward_cfg.scale_target * self._reward_target()
-            + self.reward_cfg.scale_motion * self._reward_motion()
             + self.reward_cfg.scale_attitude * self._reward_attitude()
             + self.reward_cfg.scale_action * self._reward_action_smooth()
             + self.reward_cfg.scale_tension * self._reward_tension()
             + self.reward_cfg.scale_crash * self._reward_crash()
+            + self.reward_cfg.scale_swing_pos * self._reward_swing_pos()
+            + self.reward_cfg.scale_swing_vel * self._reward_swing_vel()
+            + self.reward_cfg.scale_swing_angle * self._reward_swing_angle()
+            + self.reward_cfg.scale_smooth_accel * self._reward_smooth_accel()
+            + self.reward_cfg.scale_vel_damp * self._reward_vel_damp()
         )
 
     def _gs_rand_float(self, lower, upper, shape):
