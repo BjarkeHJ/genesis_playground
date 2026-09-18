@@ -432,6 +432,7 @@ class SlungPayloadEnv:
     def _compute_reward(self):
         self.rew_buf[:] = (
               self.reward_cfg.scale_target * self._reward_target()
+            + self.reward_cfg.scale_motion * self._reward_motion()
             + self.reward_cfg.scale_attitude * self._reward_attitude()
             + self.reward_cfg.scale_action * self._reward_action_smooth()
             + self.reward_cfg.scale_tension * self._reward_tension()

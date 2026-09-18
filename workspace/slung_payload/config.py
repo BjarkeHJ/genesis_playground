@@ -91,8 +91,8 @@ class EnvConfig:
     payload_reset_pos: tuple[float, float, float] = (0.0, 0.0, 0.025)
     payload_reset_quat: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0) # wxyz
     air_density: float = 1.225
-    terminate_if_roll_greater_than: float = 90
-    terminate_if_pitch_greater_than: float = 90
+    terminate_if_roll_greater_than: float = 45
+    terminate_if_pitch_greater_than: float = 45
     terminate_if_x_greater_than: float = 7.0 # payload x
     terminate_if_y_greater_than: float = 7.0 # payload y
     terminate_if_z_greater_than: float = 7.0 # payload agl
