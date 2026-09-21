@@ -18,8 +18,8 @@ class PPOConfig:
     clip_param: float = 0.2
     desired_kl: float = 0.01
     entropy_coef: float = 0.004
-    gamma: float = 0.999 # orig 0.99
-    lam: float = 0.99 # orig 0.95
+    gamma: float = 0.99 # orig 0.99
+    lam: float = 0.95 # orig 0.95
     learning_rate: float = 0.0003
     max_grad_norm: float = 1.0
     num_learning_epochs: int = 5
@@ -37,14 +37,14 @@ class GaussianDistributionConfig:
 @dataclass
 class ActorConfig:
     class_name: str = "MLPModel"
-    hidden_dims: list[int] = field(default_factory=lambda: [128, 128])
+    hidden_dims: list[int] = field(default_factory=lambda: [256, 256])
     activation: str = "tanh"
     distribution_cfg: GaussianDistributionConfig = field(default_factory=GaussianDistributionConfig)
 
 @dataclass
 class CriticConfig:
     class_name: str = "MLPModel"
-    hidden_dims: list[int] = field(default_factory=lambda: [128, 128])
+    hidden_dims: list[int] = field(default_factory=lambda: [256, 256])
     activation: str = "tanh"
 
 @dataclass
@@ -58,10 +58,11 @@ class TrainConfig:
     actor: ActorConfig = field(default_factory=ActorConfig)
     critic: CriticConfig = field(default_factory=CriticConfig)
     obs_groups: ObsGroupsConfig = field(default_factory=ObsGroupsConfig)
-    num_steps_per_env: int = 1000 # orig 100
+    num_steps_per_env: int = 256 # orig 100
     save_interval: int = 100
     run_name: str = ""
     logger: str = "tensorboard"
+    empirical_normalization: bool = True 
 
 # ====== TETHER CONFIG ======
 
@@ -83,12 +84,13 @@ class TetherConfig:
 class EnvConfig:
     num_envs: int = 1
     dt: float = 0.01
-    max_sim_step_n: int = 2000
-    episode_length_s: float = 15.0
+    max_sim_step_n: int = 1000
+    episode_length_s: float = 10.0
     num_actions: int = 4
-    drone_reset_pos: tuple[float, float, float] = (0.0, 0.0, 1.068)
+    payload_above_ground: float = 0.5
+    drone_reset_pos: tuple[float, float, float] = (0.0, 0.0, payload_above_ground + 0.068) # Will add tether rest_length in env to ensure initial suspension
     drone_reset_quat: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0) # wxyz
-    payload_reset_pos: tuple[float, float, float] = (0.0, 0.0, 0.025)
+    payload_reset_pos: tuple[float, float, float] = (0.0, 0.0, payload_above_ground + 0.025)  
     payload_reset_quat: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0) # wxyz
     air_density: float = 1.225
     terminate_if_roll_greater_than: float = 45
@@ -97,7 +99,7 @@ class EnvConfig:
     terminate_if_y_greater_than: float = 7.0 # payload y
     terminate_if_z_greater_than: float = 7.0 # payload agl
     at_target_th: float = 0.5
-    resampling_time_s: float = 1.0
+    resampling_time_s: float = .1
     simulate_action_latency: bool = True
     clip_actions: float = 1.0 # should be <= 1.0
 
@@ -113,11 +115,7 @@ class EnvConfig:
 
 @dataclass
 class ObservationConfig:
-    num_obs: int = 33
-    scale_rel_pos: float = 1.0 / 3.0
-    scale_lin_vel: float = 1.0 / 3.0
-    scale_ang_vel: float = 1.0 / 3.14159
-    scale_rel_swing: float = 1.0 / TetherConfig.rest_length # OBS: Could be a better solution to get the lenght here
+    num_obs: int = 31
 
 # ====== COMMAND CONFIG =======
 
@@ -133,11 +131,11 @@ class CommandConfig:
 @dataclass 
 class RewardConfig:
     sigma_target: float = 1.0
+    scale_heading: float = 2.0
 
-    scale_target: float = 10.0
-    scale_attitude: float = 5.0
-    scale_action: float = -1e-4
-    scale_tension: float = 1.0
-    scale_crash: float = -10.0
-
-    scale_motion: float = 1.0
+    w_track: float = 5.0
+    w_heading: float = 1.5
+    w_attitude: float = 2.0
+    w_attitude_drone: float = 1.0
+    w_smooth: float = -0.005
+    w_alive: float = 0.1

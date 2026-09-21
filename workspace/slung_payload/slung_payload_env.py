@@ -120,6 +120,7 @@ class SlungPayloadEnv:
 
         # Initialized state (reset pos/quat)
         self.drone_base_link_init_pos = torch.tensor(self.env_cfg.drone_reset_pos, device=self.device, dtype=gs.tc_float)
+        self.drone_base_link_init_pos[2] += self.tether_cfg.rest_length
         self.drone_base_link_init_quat = torch.tensor(self.env_cfg.drone_reset_quat, device=self.device, dtype=gs.tc_float)
         self.payload_init_pos = torch.tensor(self.env_cfg.payload_reset_pos, device=self.device, dtype=gs.tc_float)
         self.payload_init_quat = torch.tensor(self.env_cfg.payload_reset_quat, device=self.device, dtype=gs.tc_float)
@@ -272,14 +273,14 @@ class SlungPayloadEnv:
             | (self.drone_base_link_pos[:, 2] <= 0.5)
         )
 
+        # Compute reward
+        self._compute_reward()
+
         # Reset: Set true/false per envs
         timeout_buf = self.episode_length_buf > self.max_episode_length
         self.reset_buf = timeout_buf | self.crash_condition
         self.extras["time_outs"] = timeout_buf # rsl_rl should not treat timeout as terminal
         self.reset_idx(self.reset_buf.nonzero(as_tuple=False).reshape((-1,)))
-
-        # Compute reward
-        self._compute_reward()
 
         # Compute observations
         self._update_observation()
@@ -362,81 +363,63 @@ class SlungPayloadEnv:
         return (self.at_target_buf >= hold_steps).nonzero(as_tuple=False).reshape(-1)
     
     def _update_observation(self):
+        payload_proj_gravity = transform_by_quat(self.world_up, self.payload_quat)
+        drone_proj_gravity = transform_by_quat(self.world_up, self.drone_base_link_quat)
+
         self.obs_buf = torch.cat(
             [
-                torch.clip(self.payload_pos_err * self.obs_cfg.scale_rel_pos, -1, 1),
-                torch.clip(self.payload_lin_vel * self.obs_cfg.scale_lin_vel, -1, 1),
-                torch.clip(self.payload_ang_vel * self.obs_cfg.scale_ang_vel, -1, 1),
-                self.payload_quat,
-                torch.clip(self.drone_base_link_lin_vel * self.obs_cfg.scale_lin_vel, -1, 1),
-                torch.clip(self.drone_base_link_ang_vel * self.obs_cfg.scale_ang_vel, -1, 1),
-                self.drone_base_link_quat,
-                torch.clip(self.drone_payload_relative_pos * self.obs_cfg.scale_rel_swing, -1, 1),
-                torch.clip(self.drone_payload_relative_vel * self.obs_cfg.scale_rel_swing, -1, 1),
+                self.payload_pos_err,
+                self.payload_lin_vel,
+                self.payload_ang_vel,
+                payload_proj_gravity,
+                self.drone_base_link_lin_vel,
+                self.drone_base_link_ang_vel,
+                drone_proj_gravity,
+                self.drone_payload_relative_pos,
+                self.drone_payload_relative_vel,
                 self.last_actions,
             ],
             dim=1
         )
 
     # ==== REWARDS ====
-    def _reward_target(self):
-        err = self.payload_pos_err
-        dist_z  = torch.abs(err[:, 2])
-        dist_xy = torch.norm(err[:, :2], dim=1)
+    def _reward_track(self):
+        dist = torch.norm(self.payload_pos_err, dim=1)
+        track_rew = torch.exp(-dist / self.reward_cfg.sigma_target)
+        return track_rew # bound [0, 1]
 
-        r_z  = 2.0 * torch.exp(-dist_z  / self.reward_cfg.sigma_target) - 1.0
-        r_xy = 2.0 * torch.exp(-dist_xy / self.reward_cfg.sigma_target) - 1.0
-        target_rew = 2.0 * r_z + r_xy
-
-        dist_z_last  = torch.abs(self.payload_last_pos_err[:, 2])
-        dist_xy_last = torch.norm(self.payload_last_pos_err[:, :2], dim=1)
-        target_rew += 2.0 * (dist_z_last - dist_z) + (dist_xy_last - dist_xy)
-        return target_rew
-
-    def _reward_motion(self):
-        motion_rew = 0.0
-
-        payload_acc = (self.payload_lin_vel - self.payload_last_lin_vel) / self.dt
-        rel_pos_xy = self.drone_payload_relative_pos[:, :2]
-        rel_vel_xy = self.drone_payload_relative_vel[:, :2]
-
-        close_gate = torch.exp(-torch.norm(self.payload_pos_err, dim=1) / self.reward_cfg.sigma_target)
-        vel_err = self.payload_lin_vel
-        
-        motion_rew -= torch.sum(payload_acc * payload_acc, dim=1)
-        motion_rew -= torch.sum(rel_pos_xy * rel_pos_xy, dim=1)
-        motion_rew -= torch.sum(rel_vel_xy * rel_vel_xy, dim=1)
-        motion_rew -= close_gate * torch.sum(vel_err * vel_err, dim=1) 
-        return motion_rew
-
-    def _reward_tension(self):
-        dist_drone_pl = torch.norm(self.drone_payload_relative_pos, dim=1)
-        extension_frac = (dist_drone_pl - self.tether_cfg.rest_length) / self.tether_cfg.rest_length
-        tension_rew = 1.0 - torch.clip(torch.abs(extension_frac), min=0.0, max=1.0)
-        return tension_rew
+    def _reward_heading(self):
+        pl_pos_err_norm = torch.norm(self.payload_pos_err, dim=1, keepdim=True).clamp_min(1e-6)
+        pl_pos_err_hat = self.payload_pos_err / pl_pos_err_norm
+        vel_toward = (self.payload_lin_vel * pl_pos_err_hat).sum(dim=1) # dot product
+        rew_heading = torch.tanh(vel_toward / self.reward_cfg.scale_heading)
+        return rew_heading # bound [-1, 1]
 
     def _reward_attitude(self):
         up_payload = transform_by_quat(self.world_up, self.payload_quat)
-        attitude_rew = up_payload[:, 2] - 1.0 # 0 when level, negative as tilt increase
-        return attitude_rew
+        rew_attitude = up_payload[:, 2] # cos(tilt)
+        return rew_attitude # bound [-1, 1] and 1 when horizontal level
 
-    def _reward_action_smooth(self):
-        action_rew = torch.sum(torch.square(self.actions - self.last_actions), dim=1)
-        return action_rew
+    def _reward_attitude_drone(self):
+        up_drone = transform_by_quat(self.world_up, self.drone_base_link_quat)
+        rew_attitude = up_drone[:, 2] # cos(tilt)
+        return rew_attitude # bound [-1, 1] and 1 when horizontal level
 
-    def _reward_crash(self):
-        crash_rew = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_float)
-        crash_rew[self.crash_condition] = 1
-        return crash_rew
+    def _reward_smooth(self):
+        rew_smooth = -torch.sum((self.actions - self.last_actions) ** 2, dim=1)
+        return rew_smooth # bound [-4, 0] for 4 actions in [-1, 1]
+
+    def _reward_alive(self):
+        return 1.0
 
     def _compute_reward(self):
         self.rew_buf[:] = (
-              self.reward_cfg.scale_target * self._reward_target()
-            + self.reward_cfg.scale_motion * self._reward_motion()
-            + self.reward_cfg.scale_attitude * self._reward_attitude()
-            + self.reward_cfg.scale_action * self._reward_action_smooth()
-            + self.reward_cfg.scale_tension * self._reward_tension()
-            + self.reward_cfg.scale_crash * self._reward_crash()
+              self._reward_track() * self.reward_cfg.w_track
+            + self._reward_heading() * self.reward_cfg.w_heading
+            + self._reward_attitude() * self.reward_cfg.w_attitude
+            + self._reward_attitude_drone() * self.reward_cfg.w_attitude_drone
+            + self._reward_smooth() * self.reward_cfg.w_smooth
+            + self._reward_alive() * self.reward_cfg.w_alive
         )
 
     def _gs_rand_float(self, lower, upper, shape):
