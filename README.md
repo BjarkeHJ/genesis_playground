@@ -3,7 +3,8 @@
 Simulation environment for DREAM project. 
 
 ## Dependencies
-- Ubuntu 22.04 (Tested) 
+- Ubuntu 22.04 (Tested)
+- CUDA 13.0 (Tested)
 - Python 3.10.12 (Tested)
 
 ## Installation
