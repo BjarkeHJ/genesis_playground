@@ -35,7 +35,7 @@ class SlungPayloadEnv:
             vis_options=gs.options.VisOptions(rendered_envs_idx=list(range(1)),
                                                 background_color=(0.2, 0.2, 0.2)), # scene visual settings
             rigid_options=gs.options.RigidOptions(
-                dt=self.dt, # double time rigid solver
+                dt=self.dt/2.0,
                 constraint_solver=gs.constraint_solver.Newton,
                 enable_collision=True,
                 enable_joint_limit=False,
@@ -163,6 +163,9 @@ class SlungPayloadEnv:
 
         self.extras = dict() # Extra information for logging
 
+        self.reward_names = ["track", "heading", "attitude", "attitude_drone", "smooth", "action_mag", "alive"]
+        self.episode_sums = {name: torch.zeros((self.num_envs,), device=self.device, dtype=gs.tc_float) for name in self.reward_names}
+
         self.reset()
 
     def get_observations(self):
@@ -171,6 +174,8 @@ class SlungPayloadEnv:
     def reset_idx(self, envs_idx):
         if len(envs_idx) == 0:
             return
+
+        self._resample_commands(envs_idx)
 
         self.drone_base_link_pos[envs_idx] = self.drone_base_link_init_pos
         self.drone_base_link_quat[envs_idx] = self.drone_base_link_init_quat
@@ -196,14 +201,17 @@ class SlungPayloadEnv:
         self.drone_payload_relative_yaw[envs_idx] = 0.0
 
         self.last_actions[envs_idx] = 0.0
-        self.episode_length_buf[envs_idx] = 0
         self.at_target_buf[envs_idx] = 0
         self.controller.reset(envs_idx)
         self.reset_buf[envs_idx] = True # redundant True-set
 
         self.extras["episode"] = {}
+        for name in self.reward_names:
+            self.extras["episode"][f"rew_{name}"] = torch.mean(self.episode_sums[name][envs_idx]) / self.env_cfg.episode_length_s
+            self.episode_sums[name][envs_idx] = 0.0
 
-        self._resample_commands(envs_idx)
+        self.episode_length_buf[envs_idx] = 0
+
 
     def reset(self):
         self.reset_buf[:] = True
@@ -269,7 +277,7 @@ class SlungPayloadEnv:
             | (torch.abs(drone_tilt[:, 1]) >= 90.0)
             | (torch.abs(self.payload_pos_err[:, 0]) > self.env_cfg.terminate_if_x_greater_than)
             | (torch.abs(self.payload_pos_err[:, 1]) > self.env_cfg.terminate_if_y_greater_than)
-            | (self.payload_pos_err[:, 2] > self.env_cfg.terminate_if_z_greater_than)
+            | (self.payload_pos_err[:, 2] < -self.env_cfg.terminate_if_z_greater_than)
             | (self.drone_base_link_pos[:, 2] <= 0.5)
         )
 
@@ -363,18 +371,18 @@ class SlungPayloadEnv:
         return (self.at_target_buf >= hold_steps).nonzero(as_tuple=False).reshape(-1)
     
     def _update_observation(self):
-        payload_proj_gravity = transform_by_quat(self.world_up, self.payload_quat)
-        drone_proj_gravity = transform_by_quat(self.world_up, self.drone_base_link_quat)
+        payload_proj_up = transform_by_quat(self.world_up, self.payload_quat)
+        drone_proj_up = transform_by_quat(self.world_up, self.drone_base_link_quat)
 
         self.obs_buf = torch.cat(
             [
                 self.payload_pos_err,
                 self.payload_lin_vel,
                 self.payload_ang_vel,
-                payload_proj_gravity,
+                payload_proj_up,
                 self.drone_base_link_lin_vel,
                 self.drone_base_link_ang_vel,
-                drone_proj_gravity,
+                drone_proj_up,
                 self.drone_payload_relative_pos,
                 self.drone_payload_relative_vel,
                 self.last_actions,
@@ -406,21 +414,33 @@ class SlungPayloadEnv:
         return rew_attitude # bound [-1, 1] and 1 when horizontal level
 
     def _reward_smooth(self):
-        rew_smooth = -torch.sum((self.actions - self.last_actions) ** 2, dim=1)
+        rew_smooth = torch.sum((self.actions - self.last_actions) ** 2, dim=1)
         return rew_smooth # bound [-4, 0] for 4 actions in [-1, 1]
+
+    def _reward_action_magnitude(self):
+        return torch.sum(self.actions ** 2, dim=1)  # [-4, 0]
 
     def _reward_alive(self):
         return 1.0
 
     def _compute_reward(self):
-        self.rew_buf[:] = (
-              self._reward_track() * self.reward_cfg.w_track
-            + self._reward_heading() * self.reward_cfg.w_heading
-            + self._reward_attitude() * self.reward_cfg.w_attitude
-            + self._reward_attitude_drone() * self.reward_cfg.w_attitude_drone
-            + self._reward_smooth() * self.reward_cfg.w_smooth
-            + self._reward_alive() * self.reward_cfg.w_alive
-        )
+        rew_track = self._reward_track() * self.reward_cfg.w_track
+        rew_heading = self._reward_heading() * self.reward_cfg.w_heading
+        rew_attitude = self._reward_attitude() * self.reward_cfg.w_attitude
+        rew_attitude_drone = self._reward_attitude_drone() * self.reward_cfg.w_attitude_drone
+        rew_smooth = self._reward_smooth() * self.reward_cfg.w_smooth
+        rew_action_mag = self._reward_action_magnitude() * self.reward_cfg.w_action_mag
+        rew_alive = self._reward_alive() * self.reward_cfg.w_alive
+
+        self.rew_buf[:] = rew_track + rew_heading + rew_attitude + rew_attitude_drone + rew_smooth + rew_action_mag + rew_alive
+
+        self.episode_sums["track"] += rew_track
+        self.episode_sums["heading"] += rew_heading
+        self.episode_sums["attitude"] += rew_attitude
+        self.episode_sums["attitude_drone"] += rew_attitude_drone
+        self.episode_sums["smooth"] += rew_smooth
+        self.episode_sums["action_mag"] += rew_action_mag
+        self.episode_sums["alive"] += rew_alive
 
     def _gs_rand_float(self, lower, upper, shape):
         return (upper - lower) * torch.rand(size=shape, device=self.device) + lower

@@ -69,8 +69,13 @@ class TrainConfig:
 @dataclass
 class TetherConfig:
     num_tethers: int = 3
-    stiffness: float =  5000.0
-    damping: float = 100.0
+    # Sized for the worst case of all num_tethers taut and near-parallel (their attachment points are close
+    # together relative to rest_length), which combines into ~num_tethers x the per-tether stiffness/damping felt
+    # by the drone-payload pair. Since only the damping half of the tether force is implicit (see _step_tethers),
+    # the explicit stiffness term needs dt * sqrt(num_tethers * stiffness / mass_eff) to stay well below 2 for the
+    # symplectic integrator to stay stable; damping is set close to critical for that same combined stiffness.
+    stiffness: float = 1500.0
+    damping: float = 70.0
     rest_length: float = 3.0
     diameter: float = 0.005
     slack_transition_width: float = 0.1
@@ -93,8 +98,8 @@ class EnvConfig:
     payload_reset_pos: tuple[float, float, float] = (0.0, 0.0, payload_above_ground + 0.025)  
     payload_reset_quat: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0) # wxyz
     air_density: float = 1.225
-    terminate_if_roll_greater_than: float = 45
-    terminate_if_pitch_greater_than: float = 45
+    terminate_if_roll_greater_than: float = 20
+    terminate_if_pitch_greater_than: float = 20
     terminate_if_x_greater_than: float = 7.0 # payload x
     terminate_if_y_greater_than: float = 7.0 # payload y
     terminate_if_z_greater_than: float = 7.0 # payload agl
@@ -104,8 +109,8 @@ class EnvConfig:
     clip_actions: float = 1.0 # should be <= 1.0
 
     # Actuation: action = [thrust, wx, wy, wz]
-    thrust_to_weight: float = 2.0   # thrust_max = thrust_to_weight * total_weight
-    max_rate: float = 10.0           # rad/s, max commanded body rate magnitude
+    thrust_to_weight: float = 2.5   # thrust_max = thrust_to_weight * total_weight
+    max_rate: float = 5.0           # rad/s, max commanded body rate magnitude
     rate_kp: float = 0.1
     rate_ki: float = 0.05
     rate_kd: float = 0.0001
@@ -133,9 +138,11 @@ class RewardConfig:
     sigma_target: float = 1.0
     scale_heading: float = 2.0
 
-    w_track: float = 5.0
+    w_track: float = 2.5
     w_heading: float = 1.5
     w_attitude: float = 2.0
     w_attitude_drone: float = 1.0
-    w_smooth: float = 0.005
     w_alive: float = 0.1
+    
+    w_smooth: float = -0.03
+    w_action_mag: float = -0.02
