@@ -12,7 +12,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", type=str, required=True, help="Path to a saved model_*.pt checkpoint")
     parser.add_argument("--num_envs", type=int, default=1)
-    parser.add_argument("--num_steps", type=int, default=2000)
+    parser.add_argument("--num_steps", type=int, default=10000)
     args = parser.parse_args()
 
     gs.init(backend=gs.cuda)

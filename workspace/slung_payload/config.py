@@ -137,5 +137,5 @@ class RewardConfig:
     w_heading: float = 1.5
     w_attitude: float = 2.0
     w_attitude_drone: float = 1.0
-    w_smooth: float = -0.005
+    w_smooth: float = 0.005
     w_alive: float = 0.1

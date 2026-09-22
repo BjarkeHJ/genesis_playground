@@ -13,7 +13,7 @@ def main():
     train_config = TrainConfig(run_name="test")
     train_config_dict = dataclass_to_dict(train_config)
 
-    env_config = EnvConfig(num_envs=4096*2)
+    env_config = EnvConfig(num_envs=8192)
     obs_config = ObservationConfig()
     command_cfg = CommandConfig()
     reward_cfg = RewardConfig()
