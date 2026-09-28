@@ -1,5 +1,9 @@
 import genesis as gs
-import numpy as np
+import os
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", ".."))
+DRONE_PATH = os.path.join(REPO_ROOT, "system_model", "Starling2MaxURDF", "model", "starling2max.urdf")
 
 # Init scene - MUST be the first thing done
 gs.init(backend=gs.cpu)
@@ -21,12 +25,12 @@ scene.add_entity(gs.morphs.Plane())
 # Spawn in a drone entity (crazy flie)
 drone = scene.add_entity(
     gs.morphs.Drone(
-        file="urdf/drones/cf2x.urdf",
-        model="CF2X",  # "CF2X", "CF2P", or "RACE"
+        file=DRONE_PATH,
         pos=(0.0, 0.0, 0.5),  # meters, Z-up
         euler=(0.0, 0.0, 0.0),  # scipy extrinsic x-y-z, degrees
         propellers_link_name=("prop0_link", "prop1_link", "prop2_link", "prop3_link"),
         propellers_spin=(-1, 1, -1, 1),  # per propeller: -1 = CW, +1 = CCW
+        prioritize_urdf_material=True,
     ),
 )
 
@@ -35,8 +39,7 @@ drone_link = drone.get_link("base_link")
 # Build the scene with all entities (compiles kernels, visualizers etc.)
 scene.build(n_envs=1)
 
-hover_rpm = 14468.429 # balances gravity for the model
-# hover_rpm = 14475 # balances gravity for the model
+hover_rpm = 5943.67089101 # balances gravity for the model
 
 for i in range(10000):
     drone.set_propellers_rpm([hover_rpm, hover_rpm, hover_rpm, hover_rpm])
