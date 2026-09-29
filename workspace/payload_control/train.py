@@ -10,11 +10,11 @@ from config_env import EnvConfig
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--run", type=str, default="test", help="Run name under payload_control/logs")
+    parser.add_argument("--run", type=str, default="dev_test", help="Run name under payload_control/logs")
     parser.add_argument("--resume", action="store_true", help="Continue training from a checkpoint")
     parser.add_argument("--load_run", type=str, default=None, help="Run to load from (default: --run)")
     parser.add_argument("--ckpt", type=str, default=None, help="Iteration number or path to model_*.pt (default: latest)")
-    parser.add_argument("--iters", type=int, default=256)
+    parser.add_argument("--iters", type=int, default=300)
     parser.add_argument("--num_envs", type=int, default=8192)
     parser.add_argument("--headless", action="store_true")
     args = parser.parse_args()

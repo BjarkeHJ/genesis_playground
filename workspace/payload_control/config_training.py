@@ -6,7 +6,7 @@ class PPOConfig:
     clip_param: float = 0.2
     desired_kl: float = 0.01
     entropy_coef: float = 0.004
-    gamma: float = 0.995 
+    gamma: float = 0.995
     lam: float = 0.95 
     learning_rate: float = 0.0003
     max_grad_norm: float = 1.0

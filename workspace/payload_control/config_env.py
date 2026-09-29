@@ -2,6 +2,7 @@ import os
 from dataclasses import dataclass, field
 import math
 from system_model.utils.qc_rate_control import RateControlParams, MotorPlantParams
+from system_model.utils.qc_attitude_control import AttitudeControlParams
 
 EPS = 1e-9
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -31,14 +32,18 @@ class SystemConfig:
     drone_reset_quat: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0) #wxyz
     twr_max: float = 2.5
     max_throttle: float = 1.0
-    max_roll_rate: float = 5.0
-    max_pitch_rate: float = 5.0
-    max_yaw_rate: float = 5.0
     propellers_link_name: tuple[str, ...] = ("prop0_link", "prop1_link", "prop2_link", "prop3_link")
     propellers_spin: tuple[int, ...] = (-1, 1, -1, 1)
+    rotor_ct: float = 6.5
+
+    max_tilt: float = math.radians(30.0) # roll/pitch setpoint bounds [rad]
+    max_yaw_rate: float = math.radians(90.0) # yaw-rate setpoint range [rad/s]
+    thrust_tilt_comp: bool = True # divide collective by cos(tilt_sp) sp a_thrust = 0 will approx hold altitude when tilted
+    tilt_comp_max: float = math.radians(60.0) # cap on comp
+
     rate_control_params: RateControlParams = field(default_factory=RateControlParams)
     motor_plant_params: MotorPlantParams = field(default_factory=MotorPlantParams)
-    rotor_ct: float = 6.5
+    attitude_control_params: AttitudeControlParams = field(default_factory=AttitudeControlParams)
 
     # Post-init computations of dependent parameters
     def __post_init__(self):
@@ -60,6 +65,8 @@ class CommandConfig:
     approach_v_max: float = 5.0 # cruise speed far from target [m/s]
     approach_gain: float = 2.5
     a_brake: float = 2 # [m/s²]
+    vel_fb_gain: float = 1.5 
+    a_ref_max: float = 3.0 # becines a_ref(t) when introducing trajectories
 
 # ======= Observation Scales =======
 @dataclass(frozen=True)
@@ -75,6 +82,7 @@ class ObservationScales:
     sa: float = 1.0 / (math.pi / 4)
     sar: float = 1.0 / 2.0 # measure?
     ryaw: float = 1.0 / math.pi
+    drp: float = 1.0 / math.radians(45.0) # drone roll/pitch
 
 # ======= REWARD CONFIG ======
 @dataclass(frozen=True)
@@ -111,7 +119,7 @@ class EnvConfig:
     dt: float = field(init=False) # policy step [s]
 
     # Policy input and output layer dim
-    num_obs: int = 15
+    num_obs: int = 21
     num_actions: int = 4
 
     # Actions

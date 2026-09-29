@@ -6,8 +6,14 @@ import math
 from tensordict import TensorDict
 
 from system_model.utils.qc_rate_control import QCRateController, rotors_from_genesis
+from system_model.utils.qc_attitude_control import QCAttitudeController, quat_yaw
 from config_env import *
 from utils import *
+
+def rotate_to_heading(v, yaw):
+    # World ENU vector -> heading frame: rotate by -yaw about world z. Gravity stays on z, no tilt involved
+    c, s = torch.cos(yaw), torch.sin(yaw)
+    return torch.stack([c * v[:, 0] + s * v[:, 1], -s * v[:, 0] + c * v[:, 1], v[:, 2]], dim=-1)
 
 class PayloadControlEnv:
     def __init__(self, env_cfg: EnvConfig, show_viewer: bool=False, device: str="cuda"):
@@ -103,15 +109,15 @@ class PayloadControlEnv:
         # ======================== END OF SCENE SETUP ========================
 
         # Rate Controller
-        gravity = abs(self.scene.sim.options.gravity[2])
-        max_motor_thrust = self.sys_cfg.twr_max * (self.drone.get_mass() + self.payload.get_mass()) * gravity / self.drone.n_propellers
+        self.gravity = abs(self.scene.sim.options.gravity[2])
+        max_motor_thrust = self.sys_cfg.twr_max * (self.drone.get_mass() + self.payload.get_mass()) * self.gravity / self.drone.n_propellers
         rotors = rotors_from_genesis(
             self.drone,
             self.sys_cfg.propellers_link_name,
             self.sys_cfg.propellers_spin,
             ct=self.sys_cfg.rotor_ct,
         )
-        self.controller = QCRateController(
+        self.rate_ctrl = QCRateController(
             num_envs=self.num_envs,
             dt=self.sim_dt,
             rotors=rotors,
@@ -121,16 +127,27 @@ class PayloadControlEnv:
             plant=self.sys_cfg.motor_plant_params,
             dtype=gs.tc_float
         )
-        self.hover_thrust = self.controller.thrust_setpoint_for_thrust_fraction(1.0 / self.sys_cfg.twr_max)
-        self.max_rates = torch.tensor([self.sys_cfg.max_roll_rate, self.sys_cfg.max_pitch_rate, self.sys_cfg.max_yaw_rate], device=self.device, dtype=gs.tc_float)
+        self.att_ctrl = QCAttitudeController(
+            num_envs=self.num_envs,
+            dt=self.sim_dt,
+            device=self.device,
+            params=self.sys_cfg.attitude_control_params,
+            dtype=gs.tc_float,
+        )
+        self.hover_thrust = self.rate_ctrl.thrust_setpoint_for_thrust_fraction(1.0 / self.sys_cfg.twr_max)
+        self.min_cos_tilt = math.cos(self.sys_cfg.tilt_comp_max)
 
         # Initialized state
+        self.mass_eff = 1.0 / (1.0 / self.drone.get_mass() + 1.0 / self.payload.get_mass())
         self.drone_init_pos = torch.tensor(self.sys_cfg.drone_reset_pos, device=self.device, dtype=gs.tc_float)
         self.drone_init_quat = torch.tensor(self.sys_cfg.drone_reset_quat, device=self.device, dtype=gs.tc_float)
         self.payload_init_pos = torch.tensor(self.sys_cfg.payload_reset_pos, device=self.device, dtype=gs.tc_float)
         self.payload_init_quat = torch.tensor(self.sys_cfg.payload_reset_quat, device=self.device, dtype=gs.tc_float)
-        self.mass_eff = 1.0 / (1.0 / self.drone.get_mass() + 1.0 / self.payload.get_mass())
         self.world_up = torch.tensor([0.0, 0.0, 1.0], device=self.device, dtype=gs.tc_float).expand(self.num_envs, -1) # body z-axis for tilt check
+
+        s = self.cfg.obs_scales
+        self.pos_obs_scale = torch.tensor([s.px, s.py, s.pz], device=self.device, dtype=gs.tc_float)
+        self.vel_obs_scale = torch.tensor([s.vx, s.vy, s.vz], device=self.device, dtype=gs.tc_float)
 
         # Environment state buffers
         self.obs_buf = torch.zeros((self.num_envs, self.cfg.num_obs), device=self.device, dtype=gs.tc_float)
@@ -151,13 +168,20 @@ class PayloadControlEnv:
         self.payload_swing_angles_rates = torch.zeros((self.num_envs, 2), device=self.device, dtype=gs.tc_float)
         self.drone_payload_rel_yaw = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_float)
 
+        self.payload_ref_acc = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float) 
+        self.payload_swing_ref = torch.zeros((self.num_envs, 2), device=self.device, dtype=gs.tc_float) # heading frame
+        self.payload_swing_cone = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_float) # total swing angle
+
+        self.drone_roll_pitch = torch.zeros((self.num_envs, 2), device=self.device, dtype=gs.tc_float)
+        self.drone_yaw = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_float)
+
         self.extras= dict() # logging information
 
         # Reward terms (each returns its weighted per-env reward) and per-episode sums for logging
         self.reward_fns = {
             "track": self._reward_track,
             "vel_track": self._reward_vel_track,
-            "swing": self._reward_min_swing,
+            "swing": self._reward_excess_swing,
             "smooth_actions": self._reward_smooth_actions,
             "thrust_effort": self._reward_low_thrust_effort,
             "crash": self._reward_crash,
@@ -182,26 +206,37 @@ class PayloadControlEnv:
         self._resample_commands(envs_idx)
 
         # Reset drone
+        drone_quat0 = self.drone_init_quat.expand(n, -1)
         self.drone.set_pos(self.drone_init_pos.expand(n, -1), zero_velocity=True, envs_idx=envs_idx)
-        self.drone.set_quat(self.drone_init_quat.expand(n, -1), zero_velocity=True, envs_idx=envs_idx)
+        self.drone.set_quat(drone_quat0, zero_velocity=True, envs_idx=envs_idx)
 
         # Reset payload
         self.payload.set_pos(self.payload_init_pos.expand(n, -1), zero_velocity=True, envs_idx=envs_idx)
         self.payload.set_quat(self.payload_init_quat.expand(n, -1), zero_velocity=True, envs_idx=envs_idx)
 
-        # Reset internal states
+        # Reset internal states (at rest)
         self.drone_payload_rel_yaw[envs_idx] = 0.0
+        self.drone_roll_pitch[envs_idx] = 0.0
+        self.drone_yaw[envs_idx] = quat_yaw(drone_quat0)
         self.payload_pos_err[envs_idx] = self.commands[envs_idx] - self.payload.get_pos(envs_idx)
-        self.payload_vel_err[envs_idx] = self._desired_vel(self.payload_pos_err[envs_idx]) # spawned at rest
+
+        v_des0 = self._desired_vel(self.payload_pos_err[envs_idx])
+        self.payload_vel_err[envs_idx] = v_des0
+        self.payload_ref_acc[envs_idx] = self._reference_accel(self.payload_pos_err[envs_idx], v_des0, torch.zeros_like(v_des0))
         self.payload_roll_pitch[envs_idx] = 0.0
         self.payload_roll_pitch_rates[envs_idx] = 0.0
         self.payload_swing_angles[envs_idx] = 0.0
         self.payload_swing_angles_rates[envs_idx] = 0.0
 
+        self.payload_swing_ref[envs_idx] = 0.0
+        self.payload_swing_cone[envs_idx] = 0.0
+
         self.actions[envs_idx] = 0
+        self.prev_actions[envs_idx] = 0
         self.episode_length_buf[envs_idx] = 0
         self.crash_condition[envs_idx] = 0
-        self.controller.reset(envs_idx, thrust_sp=self.hover_thrust) # hover after reset
+        self.rate_ctrl.reset(envs_idx, thrust_sp=self.hover_thrust) # hover after reset
+        self.att_ctrl.reset(envs_idx, quat=drone_quat0) # yaw setpoint = current heading
 
     def reset(self):
         self.reset_buf[:] = True
@@ -211,11 +246,11 @@ class PayloadControlEnv:
 
     def step(self, actions):
         self.actions = torch.clip(actions, -self.cfg.clip_actions, self.cfg.clip_actions) # [-1; 1]
-        thrust_des, rate_des = self._scale_actions(self.actions) # [[-1;1], [-max_rate;max_rate]]
+        thrust_sp, roll_sp, pitch_sp, yawrate_sp = self._scale_actions(self.actions)
 
         # Setpoints held constant (zero-order hold) while the inner loop runs at sim rate
         for _ in range(self.decimation):
-            self._sim_step(thrust_des, rate_des)
+            self._sim_step(thrust_sp, roll_sp, pitch_sp, yawrate_sp)
 
         self._update_buffers()
         self._update_crash_conditions()
@@ -231,21 +266,31 @@ class PayloadControlEnv:
     def _scale_actions(self, actions):
             # Thrust: piecewise linear so a=0 is hover, a=-1 is zero thrust, a=+1 is max thrust
             a_thrust = actions[:, 0]
-            thrust_des = torch.where(
+            thrust_sp = torch.where(
                 a_thrust >= 0.0,
                 self.hover_thrust + a_thrust * (self.sys_cfg.max_throttle - self.hover_thrust),
                 self.hover_thrust * (1.0 + a_thrust),
             )
-            # Rates: [-1, 1] -> [-max_rate, max_rate] rad/s
-            rate_des = actions[:, 1:] * self.max_rates
-            return thrust_des, rate_des
+
+            # a[1:3] roll/pitch setpoints, a[3] yaw-rate setpoint
+            roll_sp = actions[:,1] * self.sys_cfg.max_tilt
+            pitch_sp = actions[:,2] * self.sys_cfg.max_tilt
+            yawrate_sp = actions[:,3] * self.sys_cfg.max_yaw_rate
+
+            if self.sys_cfg.thrust_tilt_comp:
+                cos_tilt = torch.clamp(torch.cos(roll_sp) * torch.cos(pitch_sp), min=self.min_cos_tilt)
+                thrust_sp = torch.clamp(thrust_sp / cos_tilt, max=self.sys_cfg.max_throttle)
+            
+            return thrust_sp, roll_sp, pitch_sp, yawrate_sp
     
-    def _sim_step(self, thrust_des, rate_des):
+    def _sim_step(self, thrust_sp, roll_sp, pitch_sp, yawrate_sp):
         # Read drone body rate state
-        drone_body_rates = transform_by_quat(self.drone.get_ang(), inv_quat(self.drone.get_quat()))
+        drone_quat = self.drone.get_quat()
+        drone_body_rates = transform_by_quat(self.drone.get_ang(), inv_quat(drone_quat))
 
         # Get motor RPM from ratecontroller/mixer
-        rpms = self.controller.update(thrust_des, rate_des, drone_body_rates)
+        rate_sp = self.att_ctrl.update(drone_quat, roll_sp, pitch_sp, yawrate_sp)
+        rpms = self.rate_ctrl.update(thrust_sp, rate_sp, drone_body_rates)
         self.drone.set_propellers_rpm(rpms)
 
         # Step tether model
@@ -287,14 +332,27 @@ class PayloadControlEnv:
     def _update_buffers(self):
         self.episode_length_buf += 1
 
-        self.payload_pos_err[:] = self.commands - self.payload.get_pos()
-        self.payload_vel_err[:] = self._desired_vel(self.payload_pos_err) - self.payload.get_vel()
+        # Drone tilt
+        drone_quat = self.drone.get_quat()
+        self.drone_roll_pitch[:] = quat_to_xyz(drone_quat, rpy=True, degrees=False)[:, :2]
+        self.drone_yaw[:] = quat_yaw(drone_quat)
+        yaw = self.drone_yaw
+
+        # Payload tracking errors + reference acceleration
+        payload_pos = self.payload.get_pos()
+        payload_vel = self.payload.get_vel()
+        self.payload_pos_err[:] = self.commands - payload_pos
+        v_des = self._desired_vel(self.payload_pos_err)
+        self.payload_vel_err[:] = v_des - payload_vel
+        self.payload_ref_acc[:] = self._reference_accel(self.payload_pos_err, v_des, payload_vel)
 
         self.payload_roll_pitch[:] = quat_to_xyz(self.payload.get_quat(), rpy=True, degrees=False)[:, :2]
         self.payload_roll_pitch_rates[:] = transform_by_quat(self.payload.get_ang(), inv_quat(self.payload.get_quat()))[:, :2]
 
-        r = self.payload.get_pos() - self.drone.get_pos()
-        r_dot = self.payload.get_vel() - self.drone.get_vel()
+        # Swing in the heading frame. r_dot is the inertial relative velocity expresed in headed axes
+        r_w = payload_pos - self.drone.get_pos()
+        r = rotate_to_heading(r_w, yaw)
+        r_dot = rotate_to_heading(payload_vel - self.drone.get_vel(), yaw)
         self.payload_swing_angles[:, 0] = torch.atan2(r[:, 0], -r[:, 2])
         self.payload_swing_angles[:, 1] = torch.atan2(r[:, 1], -r[:, 2])
         # analytical derivative of atan2(a, b): (b*a_dot - a*b_dot) / (a² + b²), with b=-r_z
@@ -302,6 +360,13 @@ class PayloadControlEnv:
         den_y = torch.clamp(r[:, 1]**2 + r[:, 2]**2, min=EPS)
         self.payload_swing_angles_rates[:, 0] = (r[:, 0] * r_dot[:, 2] - r[:, 2] * r_dot[:, 0]) / den_x
         self.payload_swing_angles_rates[:, 1] = (r[:, 1] * r_dot[:, 2] - r[:, 2] * r_dot[:, 1]) / den_y
+
+        # Quasi-static swing the reference acceleration requires
+        # T*q = m*(a + g*e_Z), q = unit(drone - payload) = -r/|r| -> swing_x = atan2(-a_x, g + a_z)
+        a_ref = rotate_to_heading(self.payload_ref_acc, yaw)
+        g_plus_az = torch.clamp(self.gravity + a_ref[:, 2], min=EPS)
+        self.payload_swing_ref[:, 0] = torch.atan2(-a_ref[:, 0], g_plus_az)
+        self.payload_swing_ref[:, 1] = torch.atan2(-a_ref[:, 1], g_plus_az)
 
     def _update_crash_conditions(self):
         drone_up_z = transform_by_quat(self.world_up, self.drone.get_quat())[:, 2]  # z-component of body z-axis
@@ -322,19 +387,24 @@ class PayloadControlEnv:
         self.extras["time_outs"] = timeout
 
     def _update_observations(self):
+        s = self.cfg.obs_scales
+        pos_err_h = rotate_to_heading(self.payload_pos_err, self.drone_yaw)
+        vel_err_h = rotate_to_heading(self.payload_vel_err, self.drone_yaw)
+
         self.obs_buf = torch.cat(
             [
-                torch.clamp(self.payload_pos_err[:, 0:1] * self.cfg.obs_scales.px, -1.0, 1.0), # rel_pos_x, dim=1
-                torch.clamp(self.payload_pos_err[:, 1:2] * self.cfg.obs_scales.py, -1.0, 1.0), # rel_pos_y, dim=1
-                torch.clamp(self.payload_pos_err[:, 2:3] * self.cfg.obs_scales.pz, -1.0, 1.0), # rel_pos_z, dim=1
-                torch.clamp(self.payload_vel_err[:, 0:1] * self.cfg.obs_scales.vx, -1.0, 1.0), # vel_err_x, dim=1
-                torch.clamp(self.payload_vel_err[:, 1:2] * self.cfg.obs_scales.vy, -1.0, 1.0), # vel_err_y, dim=1
-                torch.clamp(self.payload_vel_err[:, 2:3] * self.cfg.obs_scales.vz, -1.0, 1.0), # vel_err_z, dim=1
-                torch.clamp(self.payload_roll_pitch * self.cfg.obs_scales.rp, -1.0, 1.0), # pitch/roll, dim=2
-                torch.clamp(self.payload_roll_pitch_rates * self.cfg.obs_scales.rpr, -1.0, 1.0), # pitch/roll rates, dim=2
-                torch.clamp(self.payload_swing_angles * self.cfg.obs_scales.sa, -1.0, 1.0), # swing angles (alpha and beta), dim=2
-                torch.clamp(self.payload_swing_angles_rates * self.cfg.obs_scales.sar, -1.0, 1.0), # swing angles rates, dim=2
-                torch.clamp(self.drone_payload_rel_yaw.unsqueeze(-1) * self.cfg.obs_scales.ryaw, -1.0, 1.0), # drone-payload relative yaw, dim=1
+                # -- Task (heading frame)
+                torch.clamp(pos_err_h * self.pos_obs_scale, -1.0, 1.0), # payload pos err, dim=3
+                torch.clamp(vel_err_h * self.vel_obs_scale, -1.0, 1.0), # payload vel err vs approach law, dim=3
+                # -- Payload
+                torch.clamp(self.payload_roll_pitch * s.rp, -1.0, 1.0), # payload roll/pitch, dim=2
+                torch.clamp(self.payload_roll_pitch_rates * s.rpr, -1.0, 1.0), # payload roll/pitch rates, dim=2
+                torch.clamp(self.payload_swing_angles * s.sa, -1.0, 1.0), # swing angles (heading frame), dim=2
+                torch.clamp(self.payload_swing_angles_rates * s.sar, -1.0, 1.0), # swing angles rates (heading frame), dim=2
+                torch.clamp(self.drone_payload_rel_yaw.unsqueeze(-1) * s.ryaw, -1.0, 1.0), # drone-payload relative yaw, dim=1
+                # -- Drone
+                torch.clamp(self.drone_roll_pitch * s.drp, -1.0, 1.0), # drone tilt, dim=2
+                self.actions, # last setpoint [thrust, roll_sp, pitch_sp, yawrate_sp], dim=4
             ],
             axis=1
         )
@@ -357,6 +427,18 @@ class PayloadControlEnv:
         speed = torch.clamp(speed, max=self.cmd_cfg.approach_v_max)
         return pos_err / torch.clamp(dist, min=EPS) * speed
 
+    def _reference_accel(self, pos_err, v_des, vel):
+        c = self.cmd_cfg
+        dist = torch.norm(pos_err, dim=-1, keepdim=True)
+        u = pos_err / torch.clamp(dist, min=EPS)
+        s_brake = torch.sqrt(2 * c.a_brake * dist)
+        s_lin = c.approach_gain * dist
+        decel = torch.where(s_lin <= s_brake, c.approach_gain**2 * dist, torch.full_like(dist, c.a_brake))
+        decel = torch.where(torch.minimum(s_brake, s_lin) >= c.approach_v_max, torch.zeros_like(dist), decel)
+        a = -u * decel + c.vel_fb_gain * (v_des - vel)
+        a_norm = torch.norm(a, dim=-1, keepdim=True)
+        return a * torch.clamp(c.a_ref_max / torch.clamp(a_norm, min=EPS), max=1.0)
+
     def _reward_track(self):
         # Sharper gradient closer to the target but avoiding completely flat gradient further away
         dist = torch.norm(self.payload_pos_err, dim=1)
@@ -368,8 +450,9 @@ class PayloadControlEnv:
         vel_err_sq = torch.sum(torch.square(self.payload_vel_err), dim=1)
         return torch.exp(-vel_err_sq / self.rew_cfg.sigma_vel_track**2) * self.rew_cfg.w_vel_track
 
-    def _reward_min_swing(self):
-        angles_rew = torch.sum(torch.square(self.payload_swing_angles), dim=1) * self.rew_cfg.w_swing_angles
+    def _reward_excess_swing(self):
+        excess = self.payload_swing_angles - self.payload_swing_ref
+        angles_rew = torch.sum(torch.square(excess), dim=1) * self.rew_cfg.w_swing_angles
         rates_rew = torch.sum(torch.square(self.payload_swing_angles_rates), dim=1) * self.rew_cfg.w_swing_rate
         return angles_rew + rates_rew
 
