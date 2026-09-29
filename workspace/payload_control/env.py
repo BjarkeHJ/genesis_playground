@@ -344,17 +344,18 @@ class PayloadControlEnv:
             return
         # TODO: Make n the number of close waypoint in n-horizon trajectory
         pl_init = self.payload_init_pos
-        self.commands[envs_idx, 0] = gs_rand_float(pl_init[0] - 0.5, pl_init[0] + 0.5, shape=(len(envs_idx), ), device=self.device)
-        self.commands[envs_idx, 1] = gs_rand_float(pl_init[1] - 0.5, pl_init[1] + 0.5, shape=(len(envs_idx), ), device=self.device)
+        self.commands[envs_idx, 0] = gs_rand_float(pl_init[0] - 3.0, pl_init[0] + 3.0, shape=(len(envs_idx), ), device=self.device)
+        self.commands[envs_idx, 1] = gs_rand_float(pl_init[1] - 3.0, pl_init[1] + 3.0, shape=(len(envs_idx), ), device=self.device)
         self.commands[envs_idx, 2] = gs_rand_float(pl_init[2] - 2.0, pl_init[2] + 2.0, shape=(len(envs_idx), ), device=self.device)
             
         self.target.set_pos(self.commands[envs_idx], zero_velocity=True, envs_idx=envs_idx)
 
     def _desired_vel(self, pos_err):
-        # Saturated P-law: pos_err * gain, norm clipped to v_max (smooth at the target, no division by zero)
-        v_des = pos_err * self.cmd_cfg.approach_gain
-        speed = torch.norm(v_des, dim=-1, keepdim=True)
-        return v_des * torch.clamp(self.cmd_cfg.approach_v_max / torch.clamp(speed, min=EPS), max=1.0)
+        # Constant-decel (sqrt) profile far out, linear near the target, capped at cruise speed
+        dist = torch.norm(pos_err, dim=-1, keepdim=True)
+        speed = torch.minimum(torch.sqrt(2 * self.cmd_cfg.a_brake * dist), self.cmd_cfg.approach_gain * dist)
+        speed = torch.clamp(speed, max=self.cmd_cfg.approach_v_max)
+        return pos_err / torch.clamp(dist, min=EPS) * speed
 
     def _reward_track(self):
         # Sharper gradient closer to the target but avoiding completely flat gradient further away
@@ -379,6 +380,14 @@ class PayloadControlEnv:
     def _reward_low_thrust_effort(self):
         thrust_rew = torch.square(self.actions[:, 0]) * self.rew_cfg.w_thrust_effort
         return thrust_rew
+
+    def _reward_on_trajectory(self):
+        traj_rew = 0.0
+        # Some error between line-segment between trajectory setpoints. 
+        # Distance from payload projected onto line (3D)
+        # Will it be any different than simply following the line from payload pos to target pos - i dont think so??
+        
+        return traj_rew
 
     def _reward_crash(self):
         crash_rew = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_float)

@@ -1,6 +1,3 @@
-import os
-import re
-import glob
 import argparse
 
 import torch
@@ -11,22 +8,6 @@ from env import *
 from utils import *
 from config_training import TrainConfig
 from config_env import EnvConfig
-
-
-def resolve_ckpt(run_name, ckpt):
-    # Explicit path wins; otherwise pick model_<ckpt>.pt (or the latest one) from logs/<run_name>
-    if ckpt is not None and os.path.isfile(ckpt):
-        return ckpt
-    log_dir = os.path.join(SCRIPT_DIR, "logs", run_name)
-    if ckpt is not None:
-        path = os.path.join(log_dir, f"model_{ckpt}.pt")
-        if not os.path.isfile(path):
-            raise FileNotFoundError(f"Checkpoint not found: {path}")
-        return path
-    ckpts = glob.glob(os.path.join(log_dir, "model_*.pt"))
-    if not ckpts:
-        raise FileNotFoundError(f"No model_*.pt checkpoints in {log_dir}")
-    return max(ckpts, key=lambda p: int(re.search(r"model_(\d+)\.pt", p).group(1)))
 
 def set_targets(e, idx, hard=True):
     if hard:

@@ -31,17 +31,14 @@ class SystemConfig:
     drone_reset_quat: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0) #wxyz
     twr_max: float = 2.5
     max_throttle: float = 1.0
-    max_roll_rate: float = 10.0
-    max_pitch_rate: float = 10.0
-    max_yaw_rate: float = 10.0
+    max_roll_rate: float = 5.0
+    max_pitch_rate: float = 5.0
+    max_yaw_rate: float = 5.0
     propellers_link_name: tuple[str, ...] = ("prop0_link", "prop1_link", "prop2_link", "prop3_link")
     propellers_spin: tuple[int, ...] = (-1, 1, -1, 1)
     rate_control_params: RateControlParams = field(default_factory=RateControlParams)
     motor_plant_params: MotorPlantParams = field(default_factory=MotorPlantParams)
     rotor_ct: float = 6.5
-
-    # Misc
-    air_density: float = 1.225
 
     # Post-init computations of dependent parameters
     def __post_init__(self):
@@ -61,7 +58,8 @@ class CommandConfig:
 
     # Desired payload velocity (approach law): v_des = unit(pos_err) * min(approach_v_max, approach_gain * dist)
     approach_v_max: float = 5.0 # cruise speed far from target [m/s]
-    approach_gain: float = 0.75 # [1/s]; braking starts at v_max / gain = 2 m from target
+    approach_gain: float = 2.5
+    a_brake: float = 2 # [m/s²]
 
 # ======= Observation Scales =======
 @dataclass(frozen=True)
@@ -86,12 +84,12 @@ class RewardConfig:
     w_track_rough: float = 1.0
     w_track_fine: float = 1.5
 
-    sigma_vel_track: float = 1.0
+    sigma_vel_track: float = 2.0
     w_vel_track: float = 1.0
 
     w_swing_angles: float = -0.5
     w_swing_rate: float = -0.2
-    w_smooth_actions: float = -0.01
+    w_smooth_actions: float = -0.1
     w_thrust_effort: float = -0.005
     w_crash: float = -10.0
 
