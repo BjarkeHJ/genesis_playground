@@ -50,4 +50,3 @@ class TrainConfig:
     save_interval: int = 100
     run_name: str = ""
     logger: str = "tensorboard"
-    empirical_normalization: bool = True # does data-driven normalization of observation vector (currently no alternative)

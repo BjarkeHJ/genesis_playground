@@ -52,43 +52,60 @@ def draw_reference(e, traj, duration):
     except Exception as ex:
         print(f"(could not draw reference path: {ex})")
 
-def save_plot(log, path, at_target_th):
+def build_paths(traj, t_path, heading):
+    # Densely sampled reference path per env: (k, M, 3), used for the timing-free contour error
+    k, m = len(heading), len(t_path)
+    return traj(t_path.repeat(k), heading.repeat_interleave(m)).view(k, m, 3)
+
+def estimate_lag(pl, ref, dt, max_lag_s):
+    # Time shift tau minimizing mean |payload(t) - ref(t - tau)|  ->  (tau [s], mean error at that shift [m])
+    # pl, ref: (L, 3) histories sampled every dt
+    L = pl.shape[0]
+    best_k, best_err = 0, torch.norm(pl - ref, dim=1).mean().item()
+    for k in range(1, min(int(round(max_lag_s / dt)), L // 2) + 1):
+        err = torch.norm(pl[k:] - ref[:L - k], dim=1).mean().item()
+        if err < best_err:
+            best_k, best_err = k, err
+    return best_k * dt, best_err
+
+def save_plot(log, path, rp_limit):
+    import numpy as np
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    t = log["t"]
-    ref, pl = log["ref"], log["payload"]
-    err = [((r[0] - p[0])**2 + (r[1] - p[1])**2 + (r[2] - p[2])**2) ** 0.5 for r, p in zip(ref, pl)]
+    t = np.asarray(log["t"])
+    ref, pl = np.asarray(log["ref"]), np.asarray(log["payload"])
 
-    fig = plt.figure(figsize=(14, 8))
+    fig = plt.figure(figsize=(15, 9), layout="constrained")
     ax3d = fig.add_subplot(2, 2, 1, projection="3d")
-    ax3d.plot(*zip(*ref), "g--", label="target")
-    ax3d.plot(*zip(*pl), "b", label="payload")
+    ax3d.plot(*ref.T, "g--", label="target")
+    ax3d.plot(*pl.T, "b", label="payload")
     ax3d.set_xlabel("x [m]"); ax3d.set_ylabel("y [m]"); ax3d.set_zlabel("z [m]")
     ax3d.legend()
     ax3d.set_title("Path")
 
     ax = fig.add_subplot(2, 2, 2)
     for i, (name, col) in enumerate(zip("xyz", "rgb")):
-        ax.plot(t, [r[i] for r in ref], col + "--", lw=1)
-        ax.plot(t, [p[i] for p in pl], col, lw=1.5, label=name)
+        ax.plot(t, ref[:, i], col + "--", lw=1)
+        ax.plot(t, pl[:, i], col, lw=1.5, label=name)
     ax.set_xlabel("t [s]"); ax.set_ylabel("pos [m]"); ax.legend(); ax.grid(alpha=0.3)
     ax.set_title("Position (dashed = target)")
 
     ax = fig.add_subplot(2, 2, 3)
-    ax.plot(t, err, "k")
-    ax.axhline(at_target_th, color="r", ls=":", label=f"{at_target_th} m")
-    ax.set_xlabel("t [s]"); ax.set_ylabel("error [m]"); ax.legend(); ax.grid(alpha=0.3)
-    ax.set_title("Tracking error")
-
-    ax = fig.add_subplot(2, 2, 4)
     ax.plot(t, [math.degrees(s[0]) for s in log["swing"]], label="swing x (heading)")
     ax.plot(t, [math.degrees(s[1]) for s in log["swing"]], label="swing y (heading)")
     ax.set_xlabel("t [s]"); ax.set_ylabel("angle [deg]"); ax.legend(); ax.grid(alpha=0.3)
     ax.set_title("Swing angles")
 
-    fig.tight_layout()
+    ax = fig.add_subplot(2, 2, 4)
+    ax.plot(t, [math.degrees(v[0]) for v in log["rp"]], label="roll")
+    ax.plot(t, [math.degrees(v[1]) for v in log["rp"]], label="pitch")
+    for sgn in (1, -1):
+        ax.axhline(sgn * math.degrees(rp_limit), color="r", ls=":", label="terminate" if sgn > 0 else None)
+    ax.set_xlabel("t [s]"); ax.set_ylabel("angle [deg]"); ax.legend(); ax.grid(alpha=0.3)
+    ax.set_title("Payload roll/pitch")
+
     fig.savefig(path, dpi=120)
     plt.close(fig)
     print(f"Saved tracking plot: {path}")
@@ -105,6 +122,7 @@ def main():
     parser.add_argument("--amp", type=float, nargs=3, default=(2.5, 1.5, 1.0), metavar=("AX", "AY", "AZ"), help="Figure-8 amplitudes [m]")
     parser.add_argument("--ramp", type=float, default=2.0, help="Ease-in time for the pattern amplitude [s]")
     parser.add_argument("--rand_heading", action="store_true", help="Randomly rotate the pattern about z each episode")
+    parser.add_argument("--max_lag", type=float, default=3.0, help="Largest time lag searched when estimating the tracking delay [s]")
     parser.add_argument("--no_plot", action="store_true", help="Skip saving the env-0 tracking plot")
     args = parser.parse_args()
 
@@ -131,6 +149,8 @@ def main():
     def sample_heading(k):
         return gs_rand_float(-math.pi, math.pi, (k, ), dev) if args.rand_heading else torch.zeros(k, device=dev)
     heading = sample_heading(n)
+    t_path = torch.arange(0.0, args.duration + e.dt, e.dt, device=dev)
+    paths = build_paths(traj, t_path, heading)
 
     # Per-env running accumulators for the episode in progress
     ep_return = torch.zeros(n, device=dev)
@@ -140,9 +160,15 @@ def main():
     err_max = torch.zeros(n, device=dev)
     in_tol = torch.zeros(n, device=dev)
     max_swing = torch.zeros(n, device=dev)
+    contour_sum = torch.zeros(n, device=dev)
+    # Per-env histories for the lag estimate
+    hist_len = e.max_episode_length + 2
+    hist_pl = torch.zeros((n, hist_len, 3), device=dev)
+    hist_ref = torch.zeros((n, hist_len, 3), device=dev)
 
-    results = {k: [] for k in ("return", "length_s", "crashed", "mean_err", "rms_err", "max_err", "in_tol_frac", "max_swing_deg")}
-    plot_log = {"t": [], "ref": [], "payload": [], "swing": []}
+    results = {k: [] for k in ("return", "length_s", "crashed", "mean_err", "rms_err", "max_err", "in_tol_frac", "max_swing_deg",
+                               "lag_s", "shifted_err", "contour_err")}
+    plot_log = {"t": [], "ref": [], "payload": [], "swing": [], "rp": []}
     plot_done = args.no_plot
 
     obs = e.reset()
@@ -160,6 +186,13 @@ def main():
             alive = ~dones
             err = torch.norm(e.payload_pos_err, dim=1)
             swing = torch.max(torch.abs(e.payload_swing_angles), dim=1).values
+            payload_pos = e.payload.get_pos()
+            contour = torch.cdist(payload_pos.unsqueeze(1), paths).squeeze(1).min(dim=1).values
+
+            alive_idx = alive.nonzero(as_tuple=False).flatten()
+            step_idx = ep_len[alive_idx].long()
+            hist_pl[alive_idx, step_idx] = payload_pos[alive_idx]
+            hist_ref[alive_idx, step_idx] = ref[alive_idx]
 
             ep_return += rew
             ep_len += 1
@@ -168,16 +201,14 @@ def main():
             err_max = torch.where(alive, torch.maximum(err_max, err), err_max)
             in_tol = torch.where(alive & (err < e.cfg.at_target_th), in_tol + 1, in_tol)
             max_swing = torch.where(alive, torch.maximum(max_swing, swing), max_swing)
+            contour_sum = torch.where(alive, contour_sum + contour, contour_sum)
 
-            if not plot_done:
-                if alive[0]:
-                    plot_log["t"].append(t_next[0].item())
-                    plot_log["ref"].append(ref[0].tolist())
-                    plot_log["payload"].append(e.payload.get_pos()[0].tolist())
-                    plot_log["swing"].append(e.payload_swing_angles[0].tolist())
-                else:
-                    save_plot(plot_log, os.path.join(os.path.dirname(ckpt_path), "eval_tracking.png"), e.cfg.at_target_th)
-                    plot_done = True
+            if not plot_done and alive[0]:
+                plot_log["t"].append(t_next[0].item())
+                plot_log["ref"].append(ref[0].tolist())
+                plot_log["payload"].append(payload_pos[0].tolist())
+                plot_log["swing"].append(e.payload_swing_angles[0].tolist())
+                plot_log["rp"].append(e.payload_roll_pitch[0].tolist())
 
             done_idx = dones.nonzero(as_tuple=False).flatten()
             if len(done_idx) == 0:
@@ -186,6 +217,11 @@ def main():
             crashed = dones & ~extras["time_outs"].bool()
             live_steps = torch.clamp(ep_len - 1, min=1)
             for i in done_idx.tolist():
+                L = int(live_steps[i].item())
+                lag_s, shifted_err = estimate_lag(hist_pl[i, :L], hist_ref[i, :L], e.dt, args.max_lag)
+                if i == 0 and not plot_done:
+                    save_plot(plot_log, os.path.join(os.path.dirname(ckpt_path), "eval_tracking.png"), e.cfg.terminate_if_rollpitch_greater_than)
+                    plot_done = True
                 ep = {
                     "return": ep_return[i].item(),
                     "length_s": ep_len[i].item() * e.dt,
@@ -195,16 +231,20 @@ def main():
                     "max_err": err_max[i].item(),
                     "in_tol_frac": (in_tol[i] / live_steps[i]).item(),
                     "max_swing_deg": math.degrees(max_swing[i].item()),
+                    "lag_s": lag_s,
+                    "shifted_err": shifted_err,
+                    "contour_err": (contour_sum[i] / live_steps[i]).item(),
                 }
                 for k, v in ep.items():
                     results[k].append(v)
-                print(f"[ep {len(results['return']):4d}] return={ep['return']:8.2f}  len={ep['length_s']:5.2f}s  "
-                      f"{'CRASH' if ep['crashed'] else 'timeout'}  mean_err={ep['mean_err']:.3f}m  rms_err={ep['rms_err']:.3f}m  "
-                      f"max_err={ep['max_err']:.3f}m  in_tol={ep['in_tol_frac'] * 100:5.1f}%  max_swing={ep['max_swing_deg']:5.1f}deg")
+                print(f"[ep {len(results['return']):4d}] {'CRASH  ' if ep['crashed'] else 'timeout'}  len={ep['length_s']:5.2f}s  "
+                      f"mean_err={ep['mean_err']:.3f}m  lag={ep['lag_s']:.2f}s  shifted_err={ep['shifted_err']:.3f}m  "
+                      f"contour_err={ep['contour_err']:.3f}m  max_err={ep['max_err']:.3f}m  max_swing={ep['max_swing_deg']:5.1f}deg")
 
-            for buf in (ep_return, ep_len, err_sum, err_sq_sum, err_max, in_tol, max_swing):
+            for buf in (ep_return, ep_len, err_sum, err_sq_sum, err_max, in_tol, max_swing, contour_sum):
                 buf[done_idx] = 0.0
             heading[done_idx] = sample_heading(len(done_idx))
+            paths[done_idx] = build_paths(traj, t_path, heading[done_idx])
 
     # Summary
     res = {k: torch.tensor(v, dtype=torch.float32) for k, v in results.items()}
@@ -221,6 +261,9 @@ def main():
     print(f"rms track err     : {res['rms_err'].mean().item():.3f} m")
     print(f"max track err     : {res['max_err'].mean().item():.3f} m")
     print(f"time within {e.cfg.at_target_th} m : {res['in_tol_frac'].mean().item() * 100:.1f}%")
+    print(f"tracking lag      : {res['lag_s'].mean().item():.2f} s  (time shift that best aligns payload with target)")
+    print(f"lag-removed err   : {res['shifted_err'].mean().item():.3f} m  (shape error once the delay is removed)")
+    print(f"contour err       : {res['contour_err'].mean().item():.3f} m  (distance to the reference path, timing ignored)")
     print(f"max swing         : {res['max_swing_deg'].mean().item():.1f} deg")
 
 
