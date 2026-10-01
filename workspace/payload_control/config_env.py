@@ -61,22 +61,15 @@ class CommandConfig:
     pos_y_range: tuple[float, float] = (-3.0, 3.0)
     pos_z_range: tuple[float, float] = (1.5, 3.0)
 
-    # Desired payload velocity (approach law): v_des = unit(pos_err) * min(approach_v_max, approach_gain * dist)
-    approach_v_max: float = 5.0 # cruise speed far from target [m/s]
-    approach_gain: float = 2.5
-    a_brake: float = 2 # [m/s²]
-    vel_fb_gain: float = 1.5 
-    a_ref_max: float = 3.0 # becines a_ref(t) when introducing trajectories
-
 # ======= Observation Scales =======
 @dataclass(frozen=True)
 class ObservationScales:
     px: float = 1.0 / 3.0
     py: float = 1.0 / 3.0
     pz: float = 1.0 / 3.0
-    vx: float = 1.0 / 5.0
-    vy: float = 1.0 / 5.0
-    vz: float = 1.0 / 5.0
+    vx: float = 1.0 / 6.0 # v_max maps to 0.5 so overspeed stays visible
+    vy: float = 1.0 / 6.0
+    vz: float = 1.0 / 6.0
     rp: float = 1.0 / (math.pi / 4)
     rpr: float = 1.0 / math.pi # measure?
     sa: float = 1.0 / (math.pi / 4)
@@ -92,13 +85,11 @@ class RewardConfig:
     w_track_rough: float = 1.0
     w_track_fine: float = 1.5
 
-    sigma_vel_track: float = 2.0
-    w_vel_track: float = 1.0
+    v_max: float = 3.0 # payload speed limit [m/s]
+    w_vmax: float = -1.0 # per (m/s)² above v_max
 
-    w_swing_angles: float = -0.5
-    w_swing_rate: float = -0.2
+    w_swing_energy: float = -1.0 # per rad of equivalent swing amplitude
     w_smooth_actions: float = -0.1
-    w_thrust_effort: float = -0.005
     w_crash: float = -10.0
 
 # ====== ENVIRONMENT CONFIG ======

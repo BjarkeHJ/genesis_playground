@@ -40,7 +40,6 @@ def set_targets(e, pos):
     e.commands[:] = pos
     e.target.set_pos(pos, zero_velocity=True)
     e.payload_pos_err[:] = e.commands - e.payload.get_pos()
-    e.payload_vel_err[:] = e._desired_vel(e.payload_pos_err) - e.payload.get_vel()
     e._update_observations()
     return e.get_observations()
 

@@ -144,6 +144,8 @@ class PayloadControlEnv:
         self.payload_init_pos = torch.tensor(self.sys_cfg.payload_reset_pos, device=self.device, dtype=gs.tc_float)
         self.payload_init_quat = torch.tensor(self.sys_cfg.payload_reset_quat, device=self.device, dtype=gs.tc_float)
         self.world_up = torch.tensor([0.0, 0.0, 1.0], device=self.device, dtype=gs.tc_float).expand(self.num_envs, -1) # body z-axis for tilt check
+        # Swing-mode effective gravity |F|/M_drone, hover approximation F = (M + m) g
+        self.g_eff = (1.0 + self.payload.get_mass() / self.drone.get_mass()) * self.gravity
 
         s = self.cfg.obs_scales
         self.pos_obs_scale = torch.tensor([s.px, s.py, s.pz], device=self.device, dtype=gs.tc_float)
@@ -161,16 +163,13 @@ class PayloadControlEnv:
 
         # Observation state buffers
         self.payload_pos_err = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
-        self.payload_vel_err = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
+        self.payload_vel = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
         self.payload_roll_pitch = torch.zeros((self.num_envs, 2), device=self.device, dtype=gs.tc_float) 
         self.payload_roll_pitch_rates = torch.zeros((self.num_envs, 2), device=self.device, dtype=gs.tc_float) 
         self.payload_swing_angles = torch.zeros((self.num_envs, 2), device=self.device, dtype=gs.tc_float)
         self.payload_swing_angles_rates = torch.zeros((self.num_envs, 2), device=self.device, dtype=gs.tc_float)
         self.drone_payload_rel_yaw = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_float)
-
-        self.payload_ref_acc = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float) 
-        self.payload_swing_ref = torch.zeros((self.num_envs, 2), device=self.device, dtype=gs.tc_float) # heading frame
-        self.payload_swing_cone = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_float) # total swing angle
+        self.swing_amp = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_float) # equivalent pendulum amplitude [rad]
 
         self.drone_roll_pitch = torch.zeros((self.num_envs, 2), device=self.device, dtype=gs.tc_float)
         self.drone_yaw = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_float)
@@ -180,10 +179,9 @@ class PayloadControlEnv:
         # Reward terms (each returns its weighted per-env reward) and per-episode sums for logging
         self.reward_fns = {
             "track": self._reward_track,
-            "vel_track": self._reward_vel_track,
-            "swing": self._reward_excess_swing,
+            "vmax": self._reward_vmax,
+            "swing_energy": self._reward_swing_energy,
             "smooth_actions": self._reward_smooth_actions,
-            "thrust_effort": self._reward_low_thrust_effort,
             "crash": self._reward_crash,
         }
         self.episode_sums = {name: torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_float) for name in self.reward_fns}
@@ -219,17 +217,12 @@ class PayloadControlEnv:
         self.drone_roll_pitch[envs_idx] = 0.0
         self.drone_yaw[envs_idx] = quat_yaw(drone_quat0)
         self.payload_pos_err[envs_idx] = self.commands[envs_idx] - self.payload.get_pos(envs_idx)
-
-        v_des0 = self._desired_vel(self.payload_pos_err[envs_idx])
-        self.payload_vel_err[envs_idx] = v_des0
-        self.payload_ref_acc[envs_idx] = self._reference_accel(self.payload_pos_err[envs_idx], v_des0, torch.zeros_like(v_des0))
+        self.payload_vel[envs_idx] = 0.0
         self.payload_roll_pitch[envs_idx] = 0.0
         self.payload_roll_pitch_rates[envs_idx] = 0.0
         self.payload_swing_angles[envs_idx] = 0.0
         self.payload_swing_angles_rates[envs_idx] = 0.0
-
-        self.payload_swing_ref[envs_idx] = 0.0
-        self.payload_swing_cone[envs_idx] = 0.0
+        self.swing_amp[envs_idx] = 0.0
 
         self.actions[envs_idx] = 0
         self.prev_actions[envs_idx] = 0
@@ -338,21 +331,20 @@ class PayloadControlEnv:
         self.drone_yaw[:] = quat_yaw(drone_quat)
         yaw = self.drone_yaw
 
-        # Payload tracking errors + reference acceleration
+        # Payload tracking
         payload_pos = self.payload.get_pos()
         payload_vel = self.payload.get_vel()
         self.payload_pos_err[:] = self.commands - payload_pos
-        v_des = self._desired_vel(self.payload_pos_err)
-        self.payload_vel_err[:] = v_des - payload_vel
-        self.payload_ref_acc[:] = self._reference_accel(self.payload_pos_err, v_des, payload_vel)
+        self.payload_vel[:] = payload_vel
 
         self.payload_roll_pitch[:] = quat_to_xyz(self.payload.get_quat(), rpy=True, degrees=False)[:, :2]
         self.payload_roll_pitch_rates[:] = transform_by_quat(self.payload.get_ang(), inv_quat(self.payload.get_quat()))[:, :2]
 
         # Swing in the heading frame. r_dot is the inertial relative velocity expresed in headed axes
         r_w = payload_pos - self.drone.get_pos()
+        r_dot_w = payload_vel - self.drone.get_vel()
         r = rotate_to_heading(r_w, yaw)
-        r_dot = rotate_to_heading(payload_vel - self.drone.get_vel(), yaw)
+        r_dot = rotate_to_heading(r_dot_w, yaw)
         self.payload_swing_angles[:, 0] = torch.atan2(r[:, 0], -r[:, 2])
         self.payload_swing_angles[:, 1] = torch.atan2(r[:, 1], -r[:, 2])
         # analytical derivative of atan2(a, b): (b*a_dot - a*b_dot) / (a² + b²), with b=-r_z
@@ -361,12 +353,16 @@ class PayloadControlEnv:
         self.payload_swing_angles_rates[:, 0] = (r[:, 0] * r_dot[:, 2] - r[:, 2] * r_dot[:, 0]) / den_x
         self.payload_swing_angles_rates[:, 1] = (r[:, 1] * r_dot[:, 2] - r[:, 2] * r_dot[:, 1]) / den_y
 
-        # Quasi-static swing the reference acceleration requires
-        # T*q = m*(a + g*e_Z), q = unit(drone - payload) = -r/|r| -> swing_x = atan2(-a_x, g + a_z)
-        a_ref = rotate_to_heading(self.payload_ref_acc, yaw)
-        g_plus_az = torch.clamp(self.gravity + a_ref[:, 2], min=EPS)
-        self.payload_swing_ref[:, 0] = torch.atan2(-a_ref[:, 0], g_plus_az)
-        self.payload_swing_ref[:, 1] = torch.atan2(-a_ref[:, 1], g_plus_az)
+        # Swing-mode energy. Relative motion r_ddot = T*q/mu - F/M is a pendulum in "gravity" F/M,
+        # so its equilibrium is the cable along the thrust axis (body z). Normalised by L*g_eff:
+        # E = 1/2 |r_dot_perp|² / (L g_eff) + (1 - q·z_body) = 1 - cos(swing_amp)
+        L = torch.clamp(torch.norm(r_w, dim=1, keepdim=True), min=EPS)
+        q = -r_w / L # payload -> drone
+        r_dot_perp = r_dot_w - torch.sum(r_dot_w * q, dim=1, keepdim=True) * q # drop cable stretch
+        thrust_axis = transform_by_quat(self.world_up, drone_quat)
+        e_kin = 0.5 * torch.sum(torch.square(r_dot_perp), dim=1) / (L.squeeze(1) * self.g_eff)
+        e_pot = 1.0 - torch.sum(q * thrust_axis, dim=1)
+        self.swing_amp[:] = torch.acos(torch.clamp(1.0 - (e_kin + e_pot), min=-1.0, max=1.0))
 
     def _update_crash_conditions(self):
         drone_up_z = transform_by_quat(self.world_up, self.drone.get_quat())[:, 2]  # z-component of body z-axis
@@ -389,13 +385,13 @@ class PayloadControlEnv:
     def _update_observations(self):
         s = self.cfg.obs_scales
         pos_err_h = rotate_to_heading(self.payload_pos_err, self.drone_yaw)
-        vel_err_h = rotate_to_heading(self.payload_vel_err, self.drone_yaw)
+        vel_h = rotate_to_heading(self.payload_vel, self.drone_yaw)
 
         self.obs_buf = torch.cat(
             [
                 # -- Task (heading frame)
                 torch.clamp(pos_err_h * self.pos_obs_scale, -1.0, 1.0), # payload pos err, dim=3
-                torch.clamp(vel_err_h * self.vel_obs_scale, -1.0, 1.0), # payload vel err vs approach law, dim=3
+                torch.clamp(vel_h * self.vel_obs_scale, -1.0, 1.0), # payload vel, dim=3
                 # -- Payload
                 torch.clamp(self.payload_roll_pitch * s.rp, -1.0, 1.0), # payload roll/pitch, dim=2
                 torch.clamp(self.payload_roll_pitch_rates * s.rpr, -1.0, 1.0), # payload roll/pitch rates, dim=2
@@ -420,49 +416,24 @@ class PayloadControlEnv:
             
         self.target.set_pos(self.commands[envs_idx], zero_velocity=True, envs_idx=envs_idx)
 
-    def _desired_vel(self, pos_err):
-        # Constant-decel (sqrt) profile far out, linear near the target, capped at cruise speed
-        dist = torch.norm(pos_err, dim=-1, keepdim=True)
-        speed = torch.minimum(torch.sqrt(2 * self.cmd_cfg.a_brake * dist), self.cmd_cfg.approach_gain * dist)
-        speed = torch.clamp(speed, max=self.cmd_cfg.approach_v_max)
-        return pos_err / torch.clamp(dist, min=EPS) * speed
-
-    def _reference_accel(self, pos_err, v_des, vel):
-        c = self.cmd_cfg
-        dist = torch.norm(pos_err, dim=-1, keepdim=True)
-        u = pos_err / torch.clamp(dist, min=EPS)
-        s_brake = torch.sqrt(2 * c.a_brake * dist)
-        s_lin = c.approach_gain * dist
-        decel = torch.where(s_lin <= s_brake, c.approach_gain**2 * dist, torch.full_like(dist, c.a_brake))
-        decel = torch.where(torch.minimum(s_brake, s_lin) >= c.approach_v_max, torch.zeros_like(dist), decel)
-        a = -u * decel + c.vel_fb_gain * (v_des - vel)
-        a_norm = torch.norm(a, dim=-1, keepdim=True)
-        return a * torch.clamp(c.a_ref_max / torch.clamp(a_norm, min=EPS), max=1.0)
-
     def _reward_track(self):
         # Sharper gradient closer to the target but avoiding completely flat gradient further away
         dist = torch.norm(self.payload_pos_err, dim=1)
-        track_rew = torch.exp(-dist / self.rew_cfg.sigma_track_rough) * self.rew_cfg.w_track_rough # rough  may not be needed if vel_track works
-        track_rew += torch.exp(-dist / self.rew_cfg.sigma_track_fine) * self.rew_cfg.w_track_fine 
+        track_rew = torch.exp(-dist / self.rew_cfg.sigma_track_rough) * self.rew_cfg.w_track_rough
+        track_rew += torch.exp(-dist / self.rew_cfg.sigma_track_fine) * self.rew_cfg.w_track_fine
         return track_rew
 
-    def _reward_vel_track(self):
-        vel_err_sq = torch.sum(torch.square(self.payload_vel_err), dim=1)
-        return torch.exp(-vel_err_sq / self.rew_cfg.sigma_vel_track**2) * self.rew_cfg.w_vel_track
+    def _reward_vmax(self):
+        overspeed = torch.clamp(torch.norm(self.payload_vel, dim=1) - self.rew_cfg.v_max, min=0.0)
+        return torch.square(overspeed) * self.rew_cfg.w_vmax
 
-    def _reward_excess_swing(self):
-        excess = self.payload_swing_angles - self.payload_swing_ref
-        angles_rew = torch.sum(torch.square(excess), dim=1) * self.rew_cfg.w_swing_angles
-        rates_rew = torch.sum(torch.square(self.payload_swing_angles_rates), dim=1) * self.rew_cfg.w_swing_rate
-        return angles_rew + rates_rew
+    def _reward_swing_energy(self):
+        # Linear in amplitude so small residual swing near the target is still penalised
+        return self.swing_amp * self.rew_cfg.w_swing_energy
 
     def _reward_smooth_actions(self):
         action_rew = torch.sum(torch.square(self.actions - self.prev_actions), dim=1) * self.rew_cfg.w_smooth_actions
         return action_rew
-
-    def _reward_low_thrust_effort(self):
-        thrust_rew = torch.square(self.actions[:, 0]) * self.rew_cfg.w_thrust_effort
-        return thrust_rew
 
     def _reward_on_trajectory(self):
         traj_rew = 0.0
