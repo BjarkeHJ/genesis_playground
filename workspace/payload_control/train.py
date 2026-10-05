@@ -23,7 +23,7 @@ def main():
         raise ValueError("Run argument is required - Add with --run <name>")
 
     # gs.init(backend=gs.cuda, logging_level="warning")
-    gs.init(backend=gs.cuda)
+    gs.init(backend=gs.cuda, performance_mode=True)
 
     train_cfg = TrainConfig(run_name=args.run)
     train_cfg_dict = dataclass_to_dict(train_cfg)
