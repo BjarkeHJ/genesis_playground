@@ -35,7 +35,7 @@ def quat_mul(a, b):
     ], dim=-1)
 
 def quat_conj(q):
-    return q * torch.tensor([1.0, -1.0, -1.0, -1.0], device=q.device, dtype=q.dtype)
+    return torch.cat([q[..., :1], -q[..., 1:]], dim=-1)
 
 def quat_canonical(q):
     # w >= 0
@@ -68,12 +68,12 @@ def quat_between(src, dst):
     dt = (src * dst).sum(-1, keepdim=True)
     q = torch.cat([dt + torch.sqrt((src * src).sum(-1, keepdim=True) * (dst * dst).sum(-1, keepdim=True)), cr], dim=-1)
     # antiparallel: 180 deg about an axis orthogonal to src (the least aligned basis axis)
+    # Branchless (no flip.any()): avoids a GPU->CPU sync per call and keeps torch.compile in one graph
     flip = (cr.norm(dim=-1) < 1e-6) & (dt.squeeze(-1) < 0.0)
-    if flip.any():
-        eye = torch.eye(3, device=src.device, dtype=src.dtype)
-        axis = torch.linalg.cross(src, eye[src.abs().argmin(dim=-1)])
-        q_flip = torch.cat([torch.zeros_like(dt), axis], dim=-1)
-        q = torch.where(flip.unsqueeze(-1), q_flip, q)
+    eye = torch.eye(3, device=src.device, dtype=src.dtype)
+    axis = torch.linalg.cross(src, eye[src.abs().argmin(dim=-1)])
+    q_flip = torch.cat([torch.zeros_like(dt), axis], dim=-1)
+    q = torch.where(flip.unsqueeze(-1), q_flip, q)
     return q / q.norm(dim=-1, keepdim=True)
 
 def wrap_pi(a):

@@ -25,14 +25,14 @@ class GaussianDistributionConfig:
 @dataclass
 class ActorConfig:
     class_name: str = "MLPModel"
-    hidden_dims: list[int] = field(default_factory=lambda: [256, 256])
+    hidden_dims: list[int] = field(default_factory=lambda: [128, 128])
     activation: str = "tanh"
     distribution_cfg: GaussianDistributionConfig = field(default_factory=GaussianDistributionConfig)
 
 @dataclass
 class CriticConfig:
     class_name: str = "MLPModel"
-    hidden_dims: list[int] = field(default_factory=lambda: [256, 256])
+    hidden_dims: list[int] = field(default_factory=lambda: [128, 128])
     activation: str = "tanh"
 
 @dataclass

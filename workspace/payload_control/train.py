@@ -10,7 +10,7 @@ from config_env import EnvConfig
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--run", type=str, default="dev_test", help="Run name under payload_control/logs")
+    parser.add_argument("--run", type=str, default=None, help="Run name under payload_control/logs")
     parser.add_argument("--resume", action="store_true", help="Continue training from a checkpoint")
     parser.add_argument("--load_run", type=str, default=None, help="Run to load from (default: --run)")
     parser.add_argument("--ckpt", type=str, default=None, help="Iteration number or path to model_*.pt (default: latest)")
@@ -19,7 +19,11 @@ def main():
     parser.add_argument("--headless", action="store_true")
     args = parser.parse_args()
 
-    gs.init(backend=gs.cuda, logging_level="warning")
+    if args.run == None:
+        raise ValueError("Run argument is required - Add with --run <name>")
+
+    # gs.init(backend=gs.cuda, logging_level="warning")
+    gs.init(backend=gs.cuda)
 
     train_cfg = TrainConfig(run_name=args.run)
     train_cfg_dict = dataclass_to_dict(train_cfg)

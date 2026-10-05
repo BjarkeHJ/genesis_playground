@@ -55,11 +55,12 @@ class SystemConfig:
 @dataclass(frozen=True)
 class CommandConfig:
     num_waypoints: int = 3
-    num_commands: int = 3
+    num_commands: int = 4 # [x, y, z, yaw_ref]
 
-    pos_x_range: tuple[float, float] = (-3.0, 3.0)
-    pos_y_range: tuple[float, float] = (-3.0, 3.0)
-    pos_z_range: tuple[float, float] = (1.5, 3.0)
+    pos_x_range: float = 3.0
+    pos_y_range: float = 3.0
+    pos_z_range: float = 2.0
+    yaw_range: float = math.radians(45.0) # yaw_ref around initial payload heading (curriculum: widen towards pi)
 
 # ======= Observation Scales =======
 @dataclass(frozen=True)
@@ -70,12 +71,11 @@ class ObservationScales:
     vx: float = 1.0 / 6.0 # v_max maps to 0.5 so overspeed stays visible
     vy: float = 1.0 / 6.0
     vz: float = 1.0 / 6.0
-    rp: float = 1.0 / (math.pi / 4)
-    rpr: float = 1.0 / math.pi # measure?
-    sa: float = 1.0 / (math.pi / 4)
-    sar: float = 1.0 / 2.0 # measure?
-    ryaw: float = 1.0 / math.pi
-    drp: float = 1.0 / math.radians(45.0) # drone roll/pitch
+    pl_body_rates: float = 1.0 / math.pi # size?
+    pl_swing_angles: float = 1.0 / math.radians(60.0) # = 1 / terminate_if_swingangle_greater_than
+    pl_swing_angles_rates: float = 1.0 / 2.0 # measure?
+    rel_yaw: float = 1.0 / (0.75 * math.pi) # = 1 / terminate_if_relyaw_greater_than
+    drone_body_rates: float = 1.0 / math.pi
 
 # ======= REWARD CONFIG ======
 @dataclass(frozen=True)
@@ -89,6 +89,8 @@ class RewardConfig:
     w_vmax: float = -1.0 # per (m/s)² above v_max
 
     w_swing_energy: float = -1.0 # per rad of equivalent swing amplitude
+    w_yaw: float = -0.3 # per (1 - cos(payload yaw err))
+    w_tilt: float = -1.0 # per (1 - cos(payload tilt))
     w_smooth_actions: float = -0.1
     w_crash: float = -10.0
 
@@ -108,9 +110,10 @@ class EnvConfig:
     sim_substeps: int = 1 # internal physics substeps per sim step
     decimation: int = 8 # sim steps per policy step
     dt: float = field(init=False) # policy step [s]
+    torch_compile: bool = True # fuse the per-sim-step torch code (controllers, tethers); costs compile time at startup
 
     # Policy input and output layer dim
-    num_obs: int = 21
+    num_obs: int = 29
     num_actions: int = 4
 
     # Actions
@@ -119,16 +122,14 @@ class EnvConfig:
 
     # Terminate conditions
     episode_length_s: float = 10.0
-    terminate_if_rollpitch_greater_than: float = math.pi / 4.0
+    terminate_if_payload_tilt_greater_than: float = math.pi / 4.0
     terminate_if_swingangle_greater_than: float = math.radians(60.0)
-    terminate_if_x_greater_than: float = 7.0 # on pl pos err (bbox around target)
-    terminate_if_y_greater_than: float = 7.0 
-    terminate_if_z_greater_than: float = 7.0 
-    terminate_if_relyaw_greater_than: float = math.pi
-    terminate_if_payload_below_z: float = 0.2 # on ground
+    terminate_if_x_greater_than: float = 7.0 # on pl pos err (bbox around target, heading frame)
+    terminate_if_y_greater_than: float = 7.0
+    terminate_if_z_greater_than: float = 7.0
+    terminate_if_relyaw_greater_than: float = 0.75 * math.pi # below pi so the wrapped rel yaw never wraps before terminating
+    terminate_if_payload_below_z: float = 0.2 # ground crash
     terminate_if_drone_tilt_greater_than: float = math.radians(70.0)
-
-    at_target_th: float = 0.5
 
     # Post-init computations of dependent parameters
     def __post_init__(self):
