@@ -1,8 +1,10 @@
 import genesis as gs
 from genesis.utils.geom import transform_by_quat, inv_quat
+import genesis.utils.geom as gu
 
 import torch
 import math
+import numpy as np
 from tensordict import TensorDict
 
 from system_model.utils.qc_rate_control import QCRateController, rotors_from_genesis
@@ -36,6 +38,25 @@ def tether_forces(drone_attach_pos, drone_attach_vel, payload_attach_pos, payloa
     tension = torch.clamp(tension, min=0.0)
 
     return tension.unsqueeze(-1) * uhat
+
+def points_yaw_rate(pos, vel):
+    # World-z rotation rate of a rigid body from its attach points (N, n, 3): least-squares fit of v - v_mean = w_z x r in xy
+    r = pos - pos.mean(dim=1, keepdim=True)
+    dv = vel - vel.mean(dim=1, keepdim=True)
+    num = (r[..., 0] * dv[..., 1] - r[..., 1] * dv[..., 0]).sum(dim=1)
+    den = torch.clamp((r[..., 0]**2 + r[..., 1]**2).sum(dim=1), min=EPS)
+    return num / den
+
+def tether_torques(drone_attach_pos, drone_attach_vel, payload_attach_pos, payload_attach_vel, torsional_damping):
+    # Suspension yaw friction (rope internal friction, attachments): the tether model only damps along each line, so the
+    # twist mode is otherwise undamped. Opposes the payload-drone relative yaw rate, zero when both turn together.
+    # Torque per attach link [drone..., payload...], split evenly over the n links of each body
+    n = drone_attach_pos.shape[1]
+    rel_yaw_rate = points_yaw_rate(payload_attach_pos, payload_attach_vel) - points_yaw_rate(drone_attach_pos, drone_attach_vel)
+    tau = -torsional_damping * rel_yaw_rate / n # on payload, about world z
+    zeros = torch.zeros_like(tau)
+    tau_payload = torch.stack([zeros, zeros, tau], dim=-1).unsqueeze(1).expand(-1, n, -1)
+    return torch.cat([-tau_payload, tau_payload], dim=1)
 
 class PayloadControlEnv:
     def __init__(self, env_cfg: EnvConfig, show_viewer: bool=False, device: str="cuda"):
@@ -154,11 +175,13 @@ class PayloadControlEnv:
         self._att_ctrl_update = maybe_compile(self.att_ctrl.update)
         self._rate_ctrl_update = maybe_compile(self.rate_ctrl.update)
         self._tether_forces = maybe_compile(tether_forces)
+        self._tether_torques = maybe_compile(tether_torques)
 
         # Tether links of both entities in one solver call (each Genesis call carries a fixed Python validation cost)
         self.rigid_solver = self.scene.sim.rigid_solver
         self.tether_links_idx = torch.tensor([link.idx for link in self.drone_attach_links + self.payload_attach_links], device=self.device, dtype=gs.tc_int)
         self.num_tethers = len(self.drone_attach_links)
+        self.torsional_damping = torch.full((self.num_envs, ), self.sys_cfg.torsional_damping, device=self.device, dtype=gs.tc_float) # randomized per episode
         self.min_cos_tilt = math.cos(self.sys_cfg.tilt_comp_max)
 
         # Initialized state
@@ -174,6 +197,7 @@ class PayloadControlEnv:
         s = self.cfg.obs_scales
         self.pos_obs_scale = torch.tensor([s.px, s.py, s.pz], device=self.device, dtype=gs.tc_float)
         self.vel_obs_scale = torch.tensor([s.vx, s.vy, s.vz], device=self.device, dtype=gs.tc_float)
+        self.w_smooth_actions = torch.tensor(self.rew_cfg.w_smooth_actions, device=self.device, dtype=gs.tc_float)
 
         # Environment state buffers
         self.obs_buf = torch.zeros((self.num_envs, self.cfg.num_obs), device=self.device, dtype=gs.tc_float)
@@ -183,6 +207,7 @@ class PayloadControlEnv:
         self.commands = torch.zeros((self.num_envs, self.cmd_cfg.num_commands), device=self.device, dtype=gs.tc_float)
         self.actions = torch.zeros((self.num_envs, self.cfg.num_actions), device=self.device, dtype=gs.tc_float)
         self.prev_actions = torch.zeros((self.num_envs, self.cfg.num_actions), device=self.device, dtype=gs.tc_float)
+        self.actions_raw = torch.zeros((self.num_envs, self.cfg.num_actions), device=self.device, dtype=gs.tc_float)
         self.crash_condition = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_bool)
 
         # Observation state buffers
@@ -207,10 +232,13 @@ class PayloadControlEnv:
         self.reward_fns = {
             "track": self._reward_track,
             "vmax": self._reward_vmax,
+            "damping": self._reward_damping,
             "swing_energy": self._reward_swing_energy,
-            "yaw": self._reward_yaw,
             "tilt": self._reward_tilt,
+            "yaw_error": self._reward_yaw,
+            "yaw_damping": self._reward_yaw_damping,
             "smooth_actions": self._reward_smooth_actions,
+            "action_bound": self._reward_action_bound,
             "crash": self._reward_crash,
         }
         self.episode_sums = {name: torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_float) for name in self.reward_fns}
@@ -239,6 +267,10 @@ class PayloadControlEnv:
         payload_quat0 = self.payload_init_quat.expand(n, -1)
         self.payload.set_pos(self.payload_init_pos.expand(n, -1), zero_velocity=True, envs_idx=envs_idx)
         self.payload.set_quat(payload_quat0, zero_velocity=True, envs_idx=envs_idx)
+
+        # Suspension yaw damping (uncertain physical value)
+        lo, hi = self.sys_cfg.torsional_damping_scale_range
+        self.torsional_damping[envs_idx] = self.sys_cfg.torsional_damping * gs_rand_float(lo, hi, shape=(n, ), device=self.device)
 
         # Commands (yaw_ref sampled relative to the reset payload heading)
         payload_yaw0 = quat_yaw(payload_quat0)
@@ -273,6 +305,7 @@ class PayloadControlEnv:
         return self.get_observations()
 
     def step(self, actions):
+        self.actions_raw = actions # pre-clip policy sample, for the action bound penalty
         self.actions = torch.clip(actions, -self.cfg.clip_actions, self.cfg.clip_actions) # [-1; 1]
         thrust_sp, roll_sp, pitch_sp, yawrate_sp = self._scale_actions(self.actions)
 
@@ -337,7 +370,8 @@ class PayloadControlEnv:
             pos[:, :n], vel[:, :n], pos[:, n:], vel[:, n:],
             self.sys_cfg.rest_length, self.sys_cfg.activation_delta, self.sys_cfg.stiffness, self.sys_cfg.damping, self.mass_eff, self.sim_dt,
         )
-        self.rigid_solver.apply_links_external_wrench(force=torch.cat([force_on_drone, -force_on_drone], dim=1), links_idx=self.tether_links_idx)
+        torque = self._tether_torques(pos[:, :n], vel[:, :n], pos[:, n:], vel[:, n:], self.torsional_damping)
+        self.rigid_solver.apply_links_external_wrench(force=torch.cat([force_on_drone, -force_on_drone], dim=1), torque=torque, links_idx=self.tether_links_idx)
 
     def _update_buffers(self):
         self.episode_length_buf += 1
@@ -361,6 +395,7 @@ class PayloadControlEnv:
         self.payload_vel[:] = rotate_to_heading(payload_vel, yaw)
         self.payload_proj_g[:] = transform_by_quat(self.world_down, payload_inv_quat)
         self.payload_body_rates[:] = transform_by_quat(self.payload.get_ang(), payload_inv_quat)
+
         self.drone_payload_rel_yaw[:] = wrap_angle(payload_yaw - yaw) # will terminate before wrap-issue
 
         r_w = payload_pos - self.drone.get_pos() # drone->payload vector
@@ -448,19 +483,20 @@ class PayloadControlEnv:
         # (debug objects only exist in the viewer, which renders env 0)
         if not self.show_viewer or not (envs_idx == 0).any():
             return
-        for obj in self.target_debug_objs:
-            self.scene.clear_debug_object(obj)
-
-        radius = 0.05
-        pos = self.commands[0, :3]
+        radius, arrow_len = 0.05, 0.3
+        pos = self.commands[0, :3].cpu().numpy().astype(np.float32)
         yaw_ref = self.commands[0, 3].item()
-        heading = torch.tensor([math.cos(yaw_ref), math.sin(yaw_ref), 0.0], device=self.device)
-        color_s = (1.0, 0.0, 0.0, 1.0)
-        color_a = (0.0, 0.0, 0.0, 1.0)
-        self.target_debug_objs = [
-            self.scene.draw_debug_sphere(pos=pos.tolist(), radius=radius, color=color_s),
-            self.scene.draw_debug_arrow(pos=(pos + radius * heading).tolist(), vec=(0.3 * heading).tolist(), radius=0.008, color=color_a),
-        ]
+        heading = np.array([math.cos(yaw_ref), math.sin(yaw_ref), 0.0], dtype=np.float32)
+        arrow_pos = pos + radius * heading
+
+        if not self.target_debug_objs:
+            self.target_debug_objs = [
+                self.scene.draw_debug_sphere(pos=pos.tolist(), radius=radius, color=(1.0, 0.0, 0.0, 1.0)),
+                self.scene.draw_debug_arrow(pos=arrow_pos.tolist(), vec=(arrow_len * heading).tolist(), radius=0.008, color=(0.0, 0.0, 0.0, 1.0)),
+            ]
+            return
+        # Move the existing nodes: clearing and re-drawing every step rebuilds meshes under the viewer lock (~40% of sim rate)
+        self.scene.update_debug_objects(self.target_debug_objs, (gu.trans_to_T(pos), gu.trans_R_to_T(arrow_pos, gu.z_up_to_R(heading))))
 
     def _attach_viewer_logs(self):
         # The viewer paces one sim_dt per update, but step() updates it once per decimation substeps: scale to stay real time
@@ -469,6 +505,7 @@ class PayloadControlEnv:
         attach_sim_rate(self.scene)
         attach_log(self.scene, "|pos err| [m]", lambda: torch.norm(self.payload_pos_err, dim=1))
         attach_log(self.scene, "payload |v| [m/s]", lambda: torch.norm(self.payload_vel, dim=1))
+        attach_log(self.scene, "payload yaw error [deg]", lambda: torch.rad2deg(self.payload_yaw_err))
         attach_log(self.scene, "reward", lambda: self.rew_buf, fmt="{:+.3f}")
 
     def _reward_track(self):
@@ -483,15 +520,35 @@ class PayloadControlEnv:
         vmax_rew = torch.square(overspeed) * self.rew_cfg.w_vmax 
         return vmax_rew
 
+    def _reward_damping(self):
+        # Penalise payload speed only near the target: forces braking without slowing the approach
+        # NOTE: assumes a static setpoint. for trajectory tracking use (payload_vel - ref_vel) instead
+        dist = torch.norm(self.payload_pos_err, dim=1)
+        speed = torch.norm(self.payload_vel, dim=1)
+        damping_rew = speed * torch.exp(-dist / self.rew_cfg.sigma_damping) * self.rew_cfg.w_damping
+        return damping_rew
+
     def _reward_swing_energy(self):
         # Linear in amplitude so small residual swing near the target is still penalised
         swing_energy_rew = self.swing_amp * self.rew_cfg.w_swing_energy
         return swing_energy_rew
 
     def _reward_yaw(self):
-        # Payload heading tracking; smooth and periodic so the wrap at +-pi has no jump
-        yaw_rew = (1.0 - torch.cos(self.payload_yaw_err)) * self.rew_cfg.w_yaw
+        # Payload heading tracking, pseudo-Huber: linear outside delta so small errors are still worth correcting,
+        # quadratic inside so the pull fades near zero instead of driving bang-bang yaw commands
+        d = self.rew_cfg.delta_yaw
+        yaw_rew = (torch.sqrt(torch.square(self.payload_yaw_err) + d**2) - d) * self.rew_cfg.w_yaw
+        # yaw_rew = (torch.pi - (torch.sqrt(torch.square(self.payload_yaw_err) + d**2) - d)) * self.rew_cfg.w_yaw
         return yaw_rew
+
+    def _reward_yaw_damping(self):
+        # Yaw analogue of _reward_damping: penalise payload yaw rate only near the yaw target, so turning past it is
+        # worse than arriving slowly (braking) and residual twist swing at the target costs. Drone yaw is left free
+        d = self.rew_cfg.delta_yaw_damping
+        yaw_rate = self.payload_body_rates[:, 2] # payload tilt stays small, so body z ~ world z
+        gate = torch.exp(-torch.abs(self.payload_yaw_err) / self.rew_cfg.sigma_yaw_damping)
+        yaw_damping_rew = (torch.sqrt(torch.square(yaw_rate) + d**2) - d) * gate * self.rew_cfg.w_yaw_damping
+        return yaw_damping_rew
 
     def _reward_tilt(self):
         # Payload attitude away from level: 1 - cos(tilt) ~ tilt²/2, so small tilts during manoeuvres are nearly free
@@ -499,8 +556,16 @@ class PayloadControlEnv:
         tilt_rew = (1.0 + self.payload_proj_g[:, 2]) * self.rew_cfg.w_tilt
         return tilt_rew
 
+    def _reward_action_bound(self):
+        # Pre-clip actions beyond the clip bound: once the policy mean sits past the bound every sample clips to the same
+        # value, so PPO gets no gradient to bring it back (saturation trap). Zero inside the bound
+        excess = torch.clamp(torch.abs(self.actions_raw) - self.cfg.clip_actions, min=0.0)
+        action_bound_rew = torch.sum(torch.square(excess), dim=1) * self.rew_cfg.w_action_bound
+        return action_bound_rew
+
     def _reward_smooth_actions(self):
-        action_rew = torch.sum(torch.square(self.actions - self.prev_actions), dim=1) * self.rew_cfg.w_smooth_actions
+        # Per-axis weights (w_smooth_actions: [thrust, roll, pitch, yawrate])
+        action_rew = torch.sum(torch.square(self.actions - self.prev_actions) * self.w_smooth_actions, dim=1)
         return action_rew
 
     def _reward_on_trajectory(self):

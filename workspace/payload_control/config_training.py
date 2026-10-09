@@ -19,20 +19,20 @@ class PPOConfig:
 @dataclass
 class GaussianDistributionConfig:
     class_name: str = "GaussianDistribution"
-    init_std: float = 1.0
+    init_std: float = 0.5 # orig 1.0
     std_type: str = "scalar"
 
 @dataclass
 class ActorConfig:
     class_name: str = "MLPModel"
-    hidden_dims: list[int] = field(default_factory=lambda: [128, 128])
+    hidden_dims: list[int] = field(default_factory=lambda: [256, 256])
     activation: str = "tanh"
     distribution_cfg: GaussianDistributionConfig = field(default_factory=GaussianDistributionConfig)
 
 @dataclass
 class CriticConfig:
     class_name: str = "MLPModel"
-    hidden_dims: list[int] = field(default_factory=lambda: [128, 128])
+    hidden_dims: list[int] = field(default_factory=lambda: [256, 256])
     activation: str = "tanh"
 
 @dataclass

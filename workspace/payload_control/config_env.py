@@ -17,6 +17,8 @@ class SystemConfig:
     num_tethers: int = 3
     stiffness: float = 1500.0
     damping: float = 200.0
+    torsional_damping: float = 2e-4 # suspension yaw friction on the drone-payload relative yaw rate [N·m·s/rad], ~3% of critical for the box payload
+    torsional_damping_scale_range: tuple[float, float] = (0.5, 2.0) # per-episode randomization factor (true value is uncertain)
     rest_length: float = 2.0
     diameter: float = 0.005
     slack_transition_width: float = 0.1
@@ -37,7 +39,7 @@ class SystemConfig:
     rotor_ct: float = 6.5
 
     max_tilt: float = math.radians(30.0) # roll/pitch setpoint bounds [rad]
-    max_yaw_rate: float = math.radians(90.0) # yaw-rate setpoint range [rad/s]
+    max_yaw_rate: float = math.radians(45.0) # yaw-rate setpoint range [rad/s]
     thrust_tilt_comp: bool = True # divide collective by cos(tilt_sp) sp a_thrust = 0 will approx hold altitude when tilted
     tilt_comp_max: float = math.radians(60.0) # cap on comp
 
@@ -60,7 +62,7 @@ class CommandConfig:
     pos_x_range: float = 3.0
     pos_y_range: float = 3.0
     pos_z_range: float = 2.0
-    yaw_range: float = math.radians(45.0) # yaw_ref around initial payload heading (curriculum: widen towards pi)
+    yaw_range: float = math.radians(0.0) # yaw_ref around initial payload heading
 
 # ======= Observation Scales =======
 @dataclass(frozen=True)
@@ -88,10 +90,19 @@ class RewardConfig:
     v_max: float = 3.0 # payload speed limit [m/s]
     w_vmax: float = -1.0 # per (m/s)² above v_max
 
+    sigma_damping: float = 0.5 # gate on payload speed penalty near the target [m]
+    w_damping: float = -0.75 # per m/s of payload speed at the target
     w_swing_energy: float = -1.0 # per rad of equivalent swing amplitude
-    w_yaw: float = -0.3 # per (1 - cos(payload yaw err))
+    
+    delta_yaw: float = 0.1 # pseudo-Huber knee on payload yaw err: quadratic inside, linear outside [rad]
+    w_yaw: float = -0.3 # per rad of payload yaw err (outside the knee)
+    sigma_yaw_damping: float = 0.3 # gate on payload yaw rate penalty near the yaw target [rad]
+    delta_yaw_damping: float = 0.2 # pseudo-Huber knee on payload yaw rate [rad/s]
+    w_yaw_damping: float = -0.3 # per rad/s of payload yaw rate at the yaw target (outside the knee)
+
     w_tilt: float = -1.0 # per (1 - cos(payload tilt))
-    w_smooth_actions: float = -0.1
+    w_smooth_actions: tuple[float, float, float, float] = (-0.1, -0.1, -0.1, -0.1) # per Δa² [thrust, roll, pitch, yawrate]
+    w_action_bound: float = -1.0 # per (pre-clip |a| - clip_actions)², summed over actions
     w_crash: float = -10.0
 
 # ====== ENVIRONMENT CONFIG ======

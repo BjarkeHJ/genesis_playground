@@ -1,10 +1,12 @@
 import argparse
 import os
+import sys
 
 import torch
 import genesis as gs
 from rsl_rl.runners import OnPolicyRunner
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__)))) # payload_control/ (env, utils, configs)
 from env import *
 from utils import *
 from config_training import TrainConfig
@@ -15,6 +17,7 @@ from config_env import EnvConfig
 #   - payload swung out by a random angle/azimuth on a sphere of tether length around the drone
 #   - random lateral payload velocity kick
 #   - random drone body-rate kick
+#   - optional payload yaw-reference step (--yaw_deg)
 # The policy only has to bring the payload back to rest at the target.
 
 def sample_disturbance(e, idx, args):
@@ -40,9 +43,16 @@ def sample_disturbance(e, idx, args):
     drone_ang = w_dir * args.drone_rate * gs_rand_float(0.5, 1.0, (k, 1), dev)
     e.drone.set_dofs_velocity(drone_ang, dofs_idx_local=[3, 4, 5], envs_idx=idx)
 
-    # Target = undisturbed hover point
-    e.commands[idx] = e.payload_init_pos
-    e.target.set_pos(e.commands[idx], zero_velocity=True, envs_idx=idx)
+    # Target = undisturbed hover point, yaw_ref = reset payload heading (+ optional step)
+    yaw_step = math.radians(args.yaw_deg) * gs_rand_float(-1.0, 1.0, (k, ), dev)
+    e.commands[idx, :3] = e.payload_init_pos
+    e.commands[idx, 3] = wrap_angle(quat_yaw(e.payload.get_quat(idx)) + yaw_step)
+    e._draw_target(idx)
+
+def payload_roll_pitch(e):
+    # ZYX roll/pitch from gravity in payload body axes g_b = [sin(p), -sin(r)cos(p), -cos(r)cos(p)] (yaw-independent)
+    g = e.payload_proj_g
+    return torch.stack([torch.atan2(-g[:, 1], -g[:, 2]), torch.asin(torch.clamp(g[:, 0], -1.0, 1.0))], dim=-1)
 
 def refresh_obs(e):
     # Recompute the state-derived buffers from the (disturbed) sim state without counting a step
@@ -93,19 +103,24 @@ def save_plot(log, path, args, cfg):
 
     ax = axs[1, 1]
     for i, name in enumerate(("thrust", "roll_sp", "pitch_sp", "yawrate_sp")):
-        ax.plot(t, [a[i] for a in log["act"]], lw=1, label=name)
+        ax.plot(t, [a[i] for a in log["act"]], color=f"C{i}", lw=1, label=name)
+        ax.plot(t, [a[i] for a in log["act_raw"]], color=f"C{i}", lw=0.8, ls=":", alpha=0.7) # pre-clip: shows saturation past +-1
+    for sgn in (1, -1):
+        ax.axhline(sgn, color="k", lw=0.8, ls="--", label="clip (dotted: pre-clip)" if sgn > 0 else None)
     ax.set_ylabel("action [-]"); ax.legend(); ax.grid(alpha=0.3); ax.set_title("Actions")
 
     ax = axs[2, 0]
     ax.plot(t, [math.degrees(v[0]) for v in log["rp"]], label="roll")
     ax.plot(t, [math.degrees(v[1]) for v in log["rp"]], label="pitch")
-    pm_lines(ax, math.degrees(cfg.terminate_if_rollpitch_greater_than), "r", "terminate")
-    ax.set_xlabel("t [s]"); ax.set_ylabel("angle [deg]"); ax.legend(); ax.grid(alpha=0.3); ax.set_title("Payload roll/pitch")
+    ax.plot(t, [math.degrees(v) for v in log["yaw_err"]], label="yaw err")
+    pm_lines(ax, math.degrees(cfg.terminate_if_payload_tilt_greater_than), "r", "terminate (tilt)")
+    ax.set_xlabel("t [s]"); ax.set_ylabel("angle [deg]"); ax.legend(); ax.grid(alpha=0.3); ax.set_title("Payload attitude")
 
     ax = axs[2, 1]
-    ax.plot(t, [math.degrees(v[0]) for v in log["rp_rate"]], label="roll rate")
-    ax.plot(t, [math.degrees(v[1]) for v in log["rp_rate"]], label="pitch rate")
-    ax.set_xlabel("t [s]"); ax.set_ylabel("rate [deg/s]"); ax.legend(); ax.grid(alpha=0.3); ax.set_title("Payload roll/pitch rates (body)")
+    ax.plot(t, [math.degrees(v[0]) for v in log["body_rates"]], label="p")
+    ax.plot(t, [math.degrees(v[1]) for v in log["body_rates"]], label="q")
+    ax.plot(t, [math.degrees(v[2]) for v in log["body_rates"]], label="r")
+    ax.set_xlabel("t [s]"); ax.set_ylabel("rate [deg/s]"); ax.legend(); ax.grid(alpha=0.3); ax.set_title("Payload body rates")
 
     if log["settle_t"] is not None and not math.isnan(log["settle_t"]):
         for ax in axs.flat:
@@ -191,34 +206,38 @@ def main():
     parser.add_argument("--num_envs", type=int, default=1)
     parser.add_argument("--num_episodes", type=int, default=5, help="Stop after this many finished episodes")
     parser.add_argument("--headless", action="store_true", help="Disable the viewer (use with many envs for stats)")
+    parser.add_argument("--no_compile", action="store_true", help="Skip torch.compile of the per-sim-step code (faster startup, ~3x slower stepping)")
     parser.add_argument("--duration", type=float, default=8.0, help="Episode length [s]")
     # Disturbance magnitudes (each sampled in [0.5, 1] x value)
     parser.add_argument("--swing_deg", type=float, default=45.0, help="Initial payload swing angle [deg]")
     parser.add_argument("--payload_vel", type=float, default=1.0, help="Initial lateral payload velocity [m/s]")
     parser.add_argument("--drone_rate", type=float, default=2.0, help="Initial drone angular velocity [rad/s]")
+    parser.add_argument("--yaw_deg", type=float, default=0.0, help="Payload yaw reference step, uniform in +-value [deg]")
     # Settled = all of these hold from some time until the end of the episode
     parser.add_argument("--settle_pos", type=float, default=0.25, help="Settled position error [m]")
     parser.add_argument("--settle_swing_deg", type=float, default=5.0, help="Settled swing cone angle [deg]")
     parser.add_argument("--settle_vel", type=float, default=0.2, help="Settled payload speed [m/s]")
+    parser.add_argument("--settle_yaw_deg", type=float, default=10.0, help="Settled payload yaw error [deg]")
     parser.add_argument("--no_plot", action="store_true", help="Skip saving the env-0 plot")
     args = parser.parse_args()
 
     ckpt_path = resolve_ckpt(args.run, args.ckpt)
     print(f"Loading checkpoint: {ckpt_path}")
 
-    gs.init(backend=gs.cpu, logging_level="warning")
+    gs.init(backend=gs.cuda, logging_level="warning", performance_mode=True)
 
     # Same TrainConfig as train.py -- actor/critic architecture must match the checkpoint's saved weights
     train_cfg_dict = dataclass_to_dict(TrainConfig(run_name=args.run))
-    env_cfg = EnvConfig(num_envs=args.num_envs, episode_length_s=args.duration)
-    e = PayloadControlEnv(env_cfg=env_cfg, show_viewer=not args.headless, device="cpu")
+    env_cfg = EnvConfig(num_envs=args.num_envs, episode_length_s=args.duration, torch_compile=not args.no_compile)
+    e = PayloadControlEnv(env_cfg=env_cfg, show_viewer=not args.headless, device="cuda")
 
-    runner = OnPolicyRunner(e, train_cfg_dict, log_dir=None, device="cpu")
+    runner = OnPolicyRunner(e, train_cfg_dict, log_dir=None, device="cuda")
     runner.load(ckpt_path)
     policy = runner.get_inference_policy(device=e.device)
 
     n, dev = e.num_envs, e.device
     settle_swing = math.radians(args.settle_swing_deg)
+    settle_yaw = math.radians(args.settle_yaw_deg)
 
     # Per-env running accumulators for the episode in progress
     ep_return = torch.zeros(n, device=dev)
@@ -229,11 +248,13 @@ def main():
     max_cone = torch.zeros(n, device=dev)
     last_err = torch.zeros(n, device=dev)
     last_cone = torch.zeros(n, device=dev)
+    last_yaw_err = torch.zeros(n, device=dev)
+    init_yaw_err = torch.zeros(n, device=dev)
     last_unsettled = torch.zeros(n, device=dev) # last step index where the settle criteria were violated
 
     results = {k: [] for k in ("return", "length_s", "crashed", "settled", "settle_time_s", "init_err", "init_swing_deg",
-                               "max_err", "max_swing_deg", "final_err", "final_swing_deg")}
-    plot_log = {"t": [], "err": [], "err_vec": [], "vel": [], "cone": [], "swing": [], "speed": [], "act": [], "rp": [], "rp_rate": [],
+                               "init_yaw_err_deg", "max_err", "max_swing_deg", "final_err", "final_swing_deg", "final_yaw_err_deg")}
+    plot_log = {"t": [], "err": [], "err_vec": [], "vel": [], "cone": [], "swing": [], "speed": [], "act": [], "act_raw": [], "rp": [], "yaw_err": [], "body_rates": [],
                 "drone": [], "payload": [], "target": [], "settle_t": None}
     plot_done = args.no_plot
 
@@ -242,6 +263,7 @@ def main():
         obs = refresh_obs(e)
         init_err[idx] = torch.norm(e.payload_pos_err[idx], dim=1)
         init_cone[idx] = swing_cone(e)[idx]
+        init_yaw_err[idx] = torch.abs(e.payload_yaw_err[idx])
         return obs
 
     e.reset()
@@ -255,8 +277,9 @@ def main():
             alive = ~dones
             err = torch.norm(e.payload_pos_err, dim=1)
             cone = swing_cone(e)
-            speed = torch.norm(e.payload.get_vel(), dim=1)
-            unsettled = (err > args.settle_pos) | (cone > settle_swing) | (speed > args.settle_vel)
+            speed = torch.norm(e.payload_vel, dim=1)
+            yaw_err = torch.abs(e.payload_yaw_err)
+            unsettled = (err > args.settle_pos) | (cone > settle_swing) | (speed > args.settle_vel) | (yaw_err > settle_yaw)
 
             ep_return += rew
             ep_len += 1
@@ -264,23 +287,26 @@ def main():
             max_cone = torch.where(alive, torch.maximum(max_cone, cone), max_cone)
             last_err = torch.where(alive, err, last_err)
             last_cone = torch.where(alive, cone, last_cone)
+            last_yaw_err = torch.where(alive, yaw_err, last_yaw_err)
             last_unsettled = torch.where(alive & unsettled, ep_len, last_unsettled)
 
             if not plot_done:
                 if alive[0]:
                     plot_log["t"].append(ep_len[0].item() * e.dt)
                     plot_log["err"].append(err[0].item())
-                    plot_log["err_vec"].append(e.payload_pos_err[0].tolist())
+                    plot_log["err_vec"].append((e.commands[0, :3] - e.payload.get_pos()[0]).tolist())
                     plot_log["vel"].append(e.payload.get_vel()[0].tolist())
                     plot_log["cone"].append(cone[0].item())
                     plot_log["swing"].append(e.payload_swing_angles[0].tolist())
                     plot_log["speed"].append(speed[0].item())
                     plot_log["act"].append(e.actions[0].tolist())
-                    plot_log["rp"].append(e.payload_roll_pitch[0].tolist())
-                    plot_log["rp_rate"].append(e.payload_roll_pitch_rates[0].tolist())
+                    plot_log["act_raw"].append(e.actions_raw[0].tolist())
+                    plot_log["rp"].append(payload_roll_pitch(e)[0].tolist())
+                    plot_log["yaw_err"].append(e.payload_yaw_err[0].item())
+                    plot_log["body_rates"].append(e.payload_body_rates[0].tolist())
                     plot_log["drone"].append(e.drone.get_pos()[0].tolist())
                     plot_log["payload"].append(e.payload.get_pos()[0].tolist())
-                    plot_log["target"].append(e.commands[0].tolist())
+                    plot_log["target"].append(e.commands[0, :3].tolist())
 
             done_idx = dones.nonzero(as_tuple=False).flatten()
             if len(done_idx) == 0:
@@ -298,17 +324,19 @@ def main():
                     "settle_time_s": last_unsettled[i].item() * e.dt if settled else float("nan"),
                     "init_err": init_err[i].item(),
                     "init_swing_deg": math.degrees(init_cone[i].item()),
+                    "init_yaw_err_deg": math.degrees(init_yaw_err[i].item()),
                     "max_err": max_err[i].item(),
                     "max_swing_deg": math.degrees(max_cone[i].item()),
                     "final_err": last_err[i].item(),
                     "final_swing_deg": math.degrees(last_cone[i].item()),
+                    "final_yaw_err_deg": math.degrees(last_yaw_err[i].item()),
                 }
                 for k, v in ep.items():
                     results[k].append(v)
                 print(f"[ep {len(results['return']):4d}] {'CRASH  ' if ep['crashed'] else 'timeout'}  len={ep['length_s']:5.2f}s  "
                       f"init: err={ep['init_err']:.2f}m swing={ep['init_swing_deg']:4.1f}deg  |  "
                       f"max: err={ep['max_err']:.2f}m swing={ep['max_swing_deg']:4.1f}deg  |  "
-                      f"final: err={ep['final_err']:.3f}m swing={ep['final_swing_deg']:4.1f}deg  |  "
+                      f"final: err={ep['final_err']:.3f}m swing={ep['final_swing_deg']:4.1f}deg yaw={ep['final_yaw_err_deg']:4.1f}deg  |  "
                       f"settle={ep['settle_time_s']:.2f}s")
 
                 if i == 0 and not plot_done:
@@ -317,7 +345,7 @@ def main():
                     save_motion_plot(plot_log, os.path.join(os.path.dirname(ckpt_path), "eval_stabilize_motion.png"))
                     plot_done = True
 
-            for buf in (ep_return, ep_len, max_err, max_cone, last_err, last_cone, last_unsettled):
+            for buf in (ep_return, ep_len, max_err, max_cone, last_err, last_cone, last_yaw_err, last_unsettled):
                 buf[done_idx] = 0.0
             obs = start_episodes(done_idx)
 
@@ -326,8 +354,8 @@ def main():
     settled = res["settled"].bool()
     print("\n========== STABILIZATION EVAL SUMMARY ==========")
     print(f"checkpoint        : {ckpt_path}")
-    print(f"disturbance       : swing <= {args.swing_deg:.0f}deg, payload vel <= {args.payload_vel:.1f} m/s, drone rate <= {args.drone_rate:.1f} rad/s")
-    print(f"settle criteria   : err < {args.settle_pos} m, swing < {args.settle_swing_deg} deg, speed < {args.settle_vel} m/s (held to end)")
+    print(f"disturbance       : swing <= {args.swing_deg:.0f}deg, payload vel <= {args.payload_vel:.1f} m/s, drone rate <= {args.drone_rate:.1f} rad/s, yaw step <= {args.yaw_deg:.0f}deg")
+    print(f"settle criteria   : err < {args.settle_pos} m, swing < {args.settle_swing_deg} deg, speed < {args.settle_vel} m/s, yaw < {args.settle_yaw_deg} deg (held to end)")
     print(f"episodes          : {len(results['return'])}")
     print(f"crash rate        : {res['crashed'].mean().item() * 100:.1f}%")
     print(f"settle rate       : {settled.float().mean().item() * 100:.1f}%")
@@ -337,6 +365,7 @@ def main():
     print(f"initial err/swing : {res['init_err'].mean().item():.2f} m / {res['init_swing_deg'].mean().item():.1f} deg")
     print(f"max err/swing     : {res['max_err'].mean().item():.2f} m / {res['max_swing_deg'].mean().item():.1f} deg")
     print(f"final err/swing   : {res['final_err'].mean().item():.3f} m / {res['final_swing_deg'].mean().item():.1f} deg")
+    print(f"yaw err init/final: {res['init_yaw_err_deg'].mean().item():.1f} deg / {res['final_yaw_err_deg'].mean().item():.1f} deg")
     print(f"return            : {res['return'].mean().item():.2f} +- {res['return'].std().nan_to_num().item():.2f}")
 
 

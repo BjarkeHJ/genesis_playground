@@ -23,7 +23,7 @@ def main():
         raise ValueError("Run argument is required - Add with --run <name>")
 
     # gs.init(backend=gs.cuda, logging_level="warning")
-    gs.init(backend=gs.cuda, performance_mode=True)
+    gs.init(backend=gs.cuda, logging_level="warning", performance_mode=True)
 
     train_cfg = TrainConfig(run_name=args.run)
     train_cfg_dict = dataclass_to_dict(train_cfg)
@@ -38,6 +38,7 @@ def main():
         ckpt_path = resolve_ckpt(args.load_run or args.run, args.ckpt)
         print(f"Resuming from {ckpt_path}")
         runner.load(ckpt_path) # restores policy, optimizer and iteration counter
+        runner.current_learning_iteration += 1 # step one forward instead of redoing the last iter of the previous
 
     runner.learn(num_learning_iterations=args.iters, init_at_random_ep_len=True)
 
