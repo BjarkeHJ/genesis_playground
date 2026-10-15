@@ -1,6 +1,5 @@
-"""Training dashboard from a run's TensorBoard logs: task outcome, curriculum, penalties and return (top row), and
-optimisation health -- action std, adaptive learning rate, value loss, throughput (bottom row). Curriculum level
-changes are marked in every panel so dips can be read against them. Standalone: depends only on plot_utils."""
+"""Training dashboard from a run's TensorBoard logs: task outcome, success rate, penalties and return (top row), and
+optimisation health -- action std, adaptive learning rate, value loss, throughput (bottom row). Standalone: depends only on plot_utils."""
 import glob
 import os
 import re
@@ -8,7 +7,7 @@ import re
 import numpy as np
 from matplotlib.transforms import blended_transform_factory
 
-from plot_utils import (plt, cfg, rw, dr, STEPS_PER_S, INK, INK2, MUTED, GRID, LW, apply_style, load_scalars, require,
+from plot_utils import (plt, cfg, rw, STEPS_PER_S, INK, INK2, MUTED, LW, apply_style, load_scalars, require,
                         plot_raw_ema, parse_run_args, run_dir, save_figure)
 from config_training import PPOConfig
 
@@ -16,7 +15,7 @@ ppo = PPOConfig()
 LR_MIN, LR_MAX = 1e-5, 1e-2 # rsl_rl's adaptive-schedule clamps (algorithms/ppo.py)
 
 # Categorical slots from the shared validated set; a colour means one entity across the whole dashboard
-C_TRACK, C_CRASH, C_LEVEL, C_SUCCESS = "#2a78d6", "#e34948", "#1baf7a", "#4a3aa7"
+C_TRACK, C_CRASH, C_SUCCESS = "#2a78d6", "#e34948", "#4a3aa7"
 C_SINGLE = INK2 # single-series panels: the title names the series, no hue needed
 PENALTIES = [ # (tag, label, colour, dash) -- dashes double-encode identity, three hues sit below 3:1 on the surface
     ("damping", "damping near target", "#eb6834", "-"),
@@ -31,22 +30,6 @@ PENALTIES = [ # (tag, label, colour, dash) -- dashes double-encode identity, thr
 ]
 
 # ====== SHARED MARKERS ======
-def level_changes(S):
-    """Iterations where the curriculum level starts to move. The logged level is a mean over an iteration's resets, so a
-    step spans one or two iterations: keep the first of each run of changes."""
-    if "Curriculum/level" not in S:
-        return np.array([], int), np.array([], bool)
-    it, y = S["Curriculum/level"]
-    d = np.diff(y)
-    idx = np.flatnonzero(np.abs(d) > 1e-6) + 1
-    keep = np.r_[True, np.diff(idx) > 1] if len(idx) else np.array([], bool)
-    idx = idx[keep]
-    return it[idx], d[idx - 1] > 0
-
-def mark_level_changes(ax, changes):
-    for x, up in zip(*changes):
-        ax.axvline(x, color=C_LEVEL if up else C_CRASH, lw=0.8, ls=(0, (1, 2)), alpha=0.6, zorder=0)
-
 def checkpoints(run):
     pts = [int(m.group(1)) for f in glob.glob(os.path.join(run_dir(run), "model_*.pt"))
            if (m := re.search(r"model_(\d+)\.pt$", f))]
@@ -78,22 +61,15 @@ def plot_outcome(ax, S, ckpts):
     finish(ax, it, "Task outcome", "%")
     ax.legend(loc="upper right", bbox_to_anchor=(1.0, 0.94), fontsize=9)
 
-def plot_curriculum(ax, S):
-    if "Curriculum/level" not in S:
-        ax.text(0.5, 0.5, "no curriculum logged", ha="center", va="center", color=MUTED, transform=ax.transAxes)
-        ax.set_title("Curriculum", fontsize=12.5)
+def plot_success(ax, S):
+    if "Task/success_rate" not in S:
+        ax.text(0.5, 0.5, "no success rate logged", ha="center", va="center", color=MUTED, transform=ax.transAxes)
+        ax.set_title("Success rate", fontsize=12.5)
         return
-    it, lvl = S["Curriculum/level"]
-    ax.axhspan(100 * dr.curriculum_down, 100 * dr.curriculum_up, color=GRID, alpha=0.6, lw=0) # hold band
-    ax.fill_between(it, 0, 100 * lvl, color=C_LEVEL, alpha=0.12, lw=0)
-    ax.plot(it, 100 * lvl, color=C_LEVEL, lw=LW, label=f"DR level  (final {lvl[-1]:.1f})")
-    if "Curriculum/success_rate" in S: # sparse (one point per window): dots and a faster EMA
-        its, sr = S["Curriculum/success_rate"]
-        plot_raw_ema(ax, its, 100 * sr, C_SUCCESS, "success rate  ({final:.0f}%)", alpha=0.3, dots=True)
-    ax.text(0.02, 100 * (dr.curriculum_up + dr.curriculum_down) / 2, f"hold  {dr.curriculum_down:.0%}–{dr.curriculum_up:.0%}",
-            transform=blended_transform_factory(ax.transAxes, ax.transData), ha="left", va="center", fontsize=9, color=MUTED)
+    it, sr = S["Task/success_rate"] # sparse (one point per window): dots and a faster EMA
+    plot_raw_ema(ax, it, 100 * sr, C_SUCCESS, "success rate  ({final:.0f}%)", alpha=0.3, dots=True)
     ax.set_ylim(0, 103)
-    finish(ax, it, "Curriculum", "level × 100  /  % of windows")
+    finish(ax, it, "Success rate", "% of episodes per window")
     ax.legend(loc="lower right", fontsize=9)
 
 def plot_penalties(ax, S):
@@ -156,20 +132,19 @@ def plot_throughput(ax, S):
 def footnote(fig, x, y, fs):
     fig.text(x, y, "Thin lines / dots: raw per-iteration values · thick: EMA (α = 0.1; success rate α = 0.3). "
              f"Reward terms are episode sums divided by the {cfg.episode_length_s:g} s episode length; legend values are the final EMA. "
-             "Dotted verticals: curriculum level steps (green up, red back-off). ▲ checkpoints.",
+             "▲ checkpoints.",
              fontsize=fs, color=MUTED)
 
 def main():
     args = parse_run_args(__doc__)
     apply_style()
     S = load_scalars(args.run)
-    changes = level_changes(S)
 
     fig, axes = plt.subplots(2, 4, figsize=(22, 9.5), sharex=True)
     fig.subplots_adjust(left=0.045, right=0.99, top=0.87, bottom=0.1, wspace=0.28, hspace=0.38)
-    (a_out, a_cur, a_pen, a_ret), (a_std, a_lr, a_val, a_fps) = axes
+    (a_out, a_succ, a_pen, a_ret), (a_std, a_lr, a_val, a_fps) = axes
     plot_outcome(a_out, S, checkpoints(args.run))
-    plot_curriculum(a_cur, S)
+    plot_success(a_succ, S)
     plot_penalties(a_pen, S)
     plot_return(a_ret, S)
     plot_std(a_std, S)
@@ -177,7 +152,6 @@ def main():
     plot_value_loss(a_val, S)
     plot_throughput(a_fps, S)
     for ax in axes.flat:
-        mark_level_changes(ax, changes)
         ax.tick_params(labelbottom=True)
 
     it = require(S, "Train/mean_reward")[0]

@@ -14,7 +14,6 @@ PAYLOAD_PATH = os.path.join(REPO_ROOT, "system_model", "payload", "box", "box.ur
 @dataclass(frozen=True)
 class DomainRandConfig:
     enabled: bool = True
-    curriculum: bool = False # ramp one level 0 -> 1 that scales every enabled group's range (off: full range from the start)
     groups: tuple[str, ...] = ("init", "yaw", "tether", "bodies", "actuation") # enabled groups; left out = nominal ("yaw" left out = full yaw_ref range)
 
     # Tether
@@ -37,15 +36,10 @@ class DomainRandConfig:
     init_drone_vel: float = 0.5
     init_rel_yaw: float = math.radians(10.0)
 
-    # Curriculum (if curriculum = True). After every level change one episode passes before success is measured again
-    curriculum_interval: int = 1200 # policy steps per success window
-    curriculum_step: float = 0.2 # level increase when success > curriculum_up (5 steps to full)
-    curriculum_step_down: float = 0.2 # level decrease when success < curriculum_down
-    curriculum_up: float = 0.8 # success rate to advance
-    curriculum_down: float = 0.5 # success rate to back off
-
-    curriculum_window_s: float = 3.0 # 150 policy steps
-    curriculum_pos_err: float = 0.25 # final payload pos error that counts as success (trained policy settles to ~0.05 m)
+    # Success rate (logging only): episode reaches timeout without crash, payload near the target at the end
+    success_interval: int = 1200 # policy steps per success window
+    success_window_s: float = 3.0 # 150 policy steps
+    success_pos_err: float = 0.25 # final payload pos error that counts as success (trained policy settles to ~0.05 m)
 
 # ====== TETHER CONFIG ======
 @dataclass(frozen=True)
@@ -96,7 +90,7 @@ class CommandConfig:
     pos_x_range: float = 3.0
     pos_y_range: float = 3.0
     pos_z_range: float = 2.0
-    yaw_range: float = math.radians(90.0) # yaw_ref around initial payload heading (full range, scaled by the curriculum level when "yaw" is in DomainRandConfig.groups)
+    yaw_range: float = math.radians(90.0) # yaw_ref around initial payload heading (scaled by the env's dr_level when "yaw" is in DomainRandConfig.groups)
 
 # ======= Observation Scales =======
 @dataclass(frozen=True)

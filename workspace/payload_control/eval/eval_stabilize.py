@@ -1,5 +1,4 @@
 import argparse
-import dataclasses
 import os
 import sys
 
@@ -235,9 +234,7 @@ def main():
 
     # Same TrainConfig as train.py -- actor/critic architecture must match the checkpoint's saved weights
     train_cfg_dict = dataclass_to_dict(TrainConfig(run_name=args.run))
-    # Curriculum off: no level updates during the eval, and --dr then means full randomization ranges
-    dr_cfg = dataclasses.replace(EnvConfig().dr_cfg, curriculum=False)
-    env_cfg = EnvConfig(num_envs=args.num_envs, episode_length_s=args.duration, torch_compile=not args.no_compile, dr_cfg=dr_cfg)
+    env_cfg = EnvConfig(num_envs=args.num_envs, episode_length_s=args.duration, torch_compile=not args.no_compile)
     e = PayloadControlEnv(env_cfg=env_cfg, show_viewer=not args.headless, device="cuda")
 
     runner = OnPolicyRunner(e, train_cfg_dict, log_dir=None, device="cuda")

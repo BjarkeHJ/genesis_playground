@@ -187,14 +187,13 @@ class PayloadControlEnv:
 
         # Initialized state
         dr = self.cfg.dr_cfg
-        self.win_steps = int(dr.curriculum_window_s / self.dt)
+        self.win_steps = int(dr.success_window_s / self.dt)
         self.win_err = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_float)
 
-        self.dr_level = 0.0 if dr.curriculum else 1.0 # scales every enabled group's range, see _dr_scale
-        self.cur_success = torch.zeros((), device=self.device)
-        self.cur_count = torch.zeros((), device=self.device)
-        self.cur_steps = 0
-        self.cur_start = 0 # policy step the current success window opened
+        self.dr_level = 1.0 # scales every enabled group's range (evals set 0 for nominal), see _dr_scale
+        self.success_count = torch.zeros((), device=self.device)
+        self.episode_count = torch.zeros((), device=self.device)
+        self.success_steps = 0 # policy steps into the current success window
 
         self.payload_mass0 = self.payload.get_mass().flatten()[0].item() # get_mass() returns a tensor (scalar or per-env); nominal masses are identical across envs at build time
         self.drone_mass0 = self.drone.get_mass().flatten()[0].item()
@@ -299,7 +298,6 @@ class PayloadControlEnv:
         for name, ep_sum in self.episode_sums.items():
             self.extras["episode"][f"Episode_Reward/{name}"] = torch.mean(ep_sum[envs_idx]) / self.cfg.episode_length_s
             ep_sum[envs_idx] = 0.0
-        self.extras["episode"]["Curriculum/level"] = self.dr_level
 
         # Sample random tether parameters
         self._randomize_system_params(envs_idx)
@@ -363,19 +361,19 @@ class PayloadControlEnv:
         self._update_crash_conditions()
         self._compute_reward()
 
-        # Curriculum success: episode survived to timeout with the payload near the target (terminal state, before reset)
+        # Success: episode survived to timeout with the payload near the target (terminal state, before reset)
         in_win = (self.episode_length_buf > self.max_episode_length - self.win_steps).float()
         self.win_err += in_win * torch.norm(self.payload_pos_err, dim=1)
-        success = self.reset_buf & ~self.crash_condition & (self.win_err / self.win_steps < self.cfg.dr_cfg.curriculum_pos_err)
-        self.cur_success += success.sum()
-        self.cur_count += self.reset_buf.sum()
+        success = self.reset_buf & ~self.crash_condition & (self.win_err / self.win_steps < self.cfg.dr_cfg.success_pos_err)
+        self.success_count += success.sum()
+        self.episode_count += self.reset_buf.sum()
 
         self.reset_idx(self.reset_buf.nonzero(as_tuple=False).reshape((-1, )))
         self._update_buffers() # update again to catch initial states (cheap but could be guarded)
         self._update_observations()
         self.prev_actions = self.actions
 
-        self._update_curriculum()
+        self._log_success_rate()
 
         return self.get_observations(), self.rew_buf, self.reset_buf, self.extras
 
@@ -523,33 +521,19 @@ class PayloadControlEnv:
             axis=1
         )
 
-    def _update_curriculum(self):
-        dr = self.cfg.dr_cfg
-        self.cur_steps += 1
-        if self.cur_steps == self.cur_start: # window opens: drop episodes counted while the previous one settled
-            self.cur_success.zero_()
-            self.cur_count.zero_()
-        if self.cur_steps < self.cur_start + dr.curriculum_interval or self.cur_count.item() == 0:
+    def _log_success_rate(self):
+        # Fraction of episodes ending in success over each window of success_interval policy steps
+        self.success_steps += 1
+        if self.success_steps < self.cfg.dr_cfg.success_interval or self.episode_count.item() == 0:
             return
-        rate = (self.cur_success / self.cur_count).item()
-        self.cur_success.zero_()
-        self.cur_count.zero_()
-        self.cur_start = self.cur_steps
-        self.extras["episode"]["Curriculum/success_rate"] = rate # logged without curriculum too, for comparison
-        if not (dr.enabled and dr.curriculum):
-            return
-        if rate > dr.curriculum_up and self.dr_level < 1.0:
-            self.dr_level = round(min(1.0, self.dr_level + dr.curriculum_step), 6) # round: no float drift in the logged level
-        elif rate < dr.curriculum_down and self.dr_level > 0.0:
-            self.dr_level = round(max(0.0, self.dr_level - dr.curriculum_step_down), 6)
-        else:
-            return
-        # Level changed: skip one episode length so the next window only sees episodes started at the new level
-        self.cur_start = self.cur_steps + self.max_episode_length
+        self.extras["episode"]["Task/success_rate"] = (self.success_count / self.episode_count).item()
+        self.success_count.zero_()
+        self.episode_count.zero_()
+        self.success_steps = 0
 
     def _dr_scale(self, group):
-        # Range scale of a randomization group: the curriculum level if enabled, else nominal (0).
-        # "yaw" is the task's yaw_ref range rather than a randomization, so it is full (1) unless ramped
+        # Range scale of a randomization group: dr_level if enabled, else nominal (0).
+        # "yaw" is the task's yaw_ref range rather than a randomization, so it is full (1) when not in groups
         dr = self.cfg.dr_cfg
         if dr.enabled and group in dr.groups:
             return self.dr_level
