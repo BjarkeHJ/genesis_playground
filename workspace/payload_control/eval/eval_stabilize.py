@@ -1,4 +1,5 @@
 import argparse
+import dataclasses
 import os
 import sys
 
@@ -7,6 +8,10 @@ import genesis as gs
 from rsl_rl.runners import OnPolicyRunner
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__)))) # payload_control/ (env, utils, configs)
+
+from run_config import use_run_configs, plots_dir
+use_run_configs() # logs/<--run>/config in place of the current configs -- must precede env/utils imports
+
 from env import *
 from utils import *
 from config_training import TrainConfig
@@ -208,6 +213,8 @@ def main():
     parser.add_argument("--headless", action="store_true", help="Disable the viewer (use with many envs for stats)")
     parser.add_argument("--no_compile", action="store_true", help="Skip torch.compile of the per-sim-step code (faster startup, ~3x slower stepping)")
     parser.add_argument("--duration", type=float, default=8.0, help="Episode length [s]")
+    parser.add_argument("--dr", action="store_true", help="Full domain randomization ranges (default: nominal system)")
+    parser.add_argument("--seed", type=int, default=0, help="Seed of the disturbances, reset states (and system params with --dr)")
     # Disturbance magnitudes (each sampled in [0.5, 1] x value)
     parser.add_argument("--swing_deg", type=float, default=45.0, help="Initial payload swing angle [deg]")
     parser.add_argument("--payload_vel", type=float, default=1.0, help="Initial lateral payload velocity [m/s]")
@@ -224,16 +231,21 @@ def main():
     ckpt_path = resolve_ckpt(args.run, args.ckpt)
     print(f"Loading checkpoint: {ckpt_path}")
 
-    gs.init(backend=gs.cuda, logging_level="warning", performance_mode=True)
+    gs.init(backend=gs.cuda, logging_level="warning", performance_mode=True, seed=args.seed)
 
     # Same TrainConfig as train.py -- actor/critic architecture must match the checkpoint's saved weights
     train_cfg_dict = dataclass_to_dict(TrainConfig(run_name=args.run))
-    env_cfg = EnvConfig(num_envs=args.num_envs, episode_length_s=args.duration, torch_compile=not args.no_compile)
+    # Curriculum off: no level updates during the eval, and --dr then means full randomization ranges
+    dr_cfg = dataclasses.replace(EnvConfig().dr_cfg, curriculum=False)
+    env_cfg = EnvConfig(num_envs=args.num_envs, episode_length_s=args.duration, torch_compile=not args.no_compile, dr_cfg=dr_cfg)
     e = PayloadControlEnv(env_cfg=env_cfg, show_viewer=not args.headless, device="cuda")
 
     runner = OnPolicyRunner(e, train_cfg_dict, log_dir=None, device="cuda")
     runner.load(ckpt_path)
-    policy = runner.get_inference_policy(device=e.device)
+    policy = runner.get_inference_policy(device=e.device) # deterministic: actor mean, no action sampling
+
+    if not args.dr:
+        e.dr_level = 0.0 # nominal params, no init-state randomization
 
     n, dev = e.num_envs, e.device
     settle_swing = math.radians(args.settle_swing_deg)
@@ -341,8 +353,9 @@ def main():
 
                 if i == 0 and not plot_done:
                     plot_log["settle_t"] = ep["settle_time_s"]
-                    save_plot(plot_log, os.path.join(os.path.dirname(ckpt_path), "eval_stabilize.png"), args, e.cfg)
-                    save_motion_plot(plot_log, os.path.join(os.path.dirname(ckpt_path), "eval_stabilize_motion.png"))
+                    out = plots_dir(os.path.dirname(ckpt_path), os.path.splitext(os.path.basename(ckpt_path))[0]) # logs/<run>/plots/model_<iter>
+                    save_plot(plot_log, os.path.join(out, "eval_stabilize.png"), args, e.cfg)
+                    save_motion_plot(plot_log, os.path.join(out, "eval_stabilize_motion.png"))
                     plot_done = True
 
             for buf in (ep_return, ep_len, max_err, max_cone, last_err, last_cone, last_yaw_err, last_unsettled):
@@ -354,7 +367,8 @@ def main():
     settled = res["settled"].bool()
     print("\n========== STABILIZATION EVAL SUMMARY ==========")
     print(f"checkpoint        : {ckpt_path}")
-    print(f"disturbance       : swing <= {args.swing_deg:.0f}deg, payload vel <= {args.payload_vel:.1f} m/s, drone rate <= {args.drone_rate:.1f} rad/s, yaw step <= {args.yaw_deg:.0f}deg")
+    print(f"system            : {'full domain randomization' if args.dr else 'nominal'}, seed={args.seed}")
+    print(f"disturbance      : swing <= {args.swing_deg:.0f}deg, payload vel <= {args.payload_vel:.1f} m/s, drone rate <= {args.drone_rate:.1f} rad/s, yaw step <= {args.yaw_deg:.0f}deg")
     print(f"settle criteria   : err < {args.settle_pos} m, swing < {args.settle_swing_deg} deg, speed < {args.settle_vel} m/s, yaw < {args.settle_yaw_deg} deg (held to end)")
     print(f"episodes          : {len(results['return'])}")
     print(f"crash rate        : {res['crashed'].mean().item() * 100:.1f}%")

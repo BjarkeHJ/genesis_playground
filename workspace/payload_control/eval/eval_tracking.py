@@ -1,4 +1,5 @@
 import argparse
+import dataclasses
 import os
 import sys
 
@@ -7,6 +8,10 @@ import genesis as gs
 from rsl_rl.runners import OnPolicyRunner
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__)))) # payload_control/ (env, utils, configs)
+
+from run_config import use_run_configs, plots_dir
+use_run_configs() # logs/<--run>/config in place of the current configs -- must precede env/utils imports
+
 from env import *
 from utils import *
 from config_training import TrainConfig
@@ -154,6 +159,8 @@ def main():
     parser.add_argument("--headless", action="store_true", help="Disable the viewer (use with many envs for stats)")
     parser.add_argument("--no_compile", action="store_true", help="Skip torch.compile of the per-sim-step code (faster startup, ~3x slower stepping)")
     parser.add_argument("--duration", type=float, default=24.0, help="Episode length [s] (default: two laps)")
+    parser.add_argument("--dr", action="store_true", help="Full domain randomization ranges (default: nominal system)")
+    parser.add_argument("--seed", type=int, default=0, help="Seed of the reset states, pattern headings (and system params with --dr)")
     parser.add_argument("--period", type=float, default=12.0, help="Figure-8 lap time [s] (lower = harder)")
     parser.add_argument("--amp", type=float, nargs=3, default=(2.5, 1.5, 1.0), metavar=("AX", "AY", "AZ"), help="Figure-8 amplitudes [m]")
     parser.add_argument("--ramp", type=float, default=2.0, help="Ease-in time for the pattern amplitude [s]")
@@ -171,16 +178,21 @@ def main():
     ckpt_path = resolve_ckpt(args.run, args.ckpt)
     print(f"Loading checkpoint: {ckpt_path}")
 
-    gs.init(backend=gs.cuda, logging_level="warning", performance_mode=True)
+    gs.init(backend=gs.cuda, logging_level="warning", performance_mode=True, seed=args.seed)
 
     # Same TrainConfig as train.py -- actor/critic architecture must match the checkpoint's saved weights
     train_cfg_dict = dataclass_to_dict(TrainConfig(run_name=args.run))
-    env_cfg = EnvConfig(num_envs=args.num_envs, episode_length_s=args.duration, torch_compile=not args.no_compile)
+    # Curriculum off: no level updates during the eval, and --dr then means full randomization ranges
+    dr_cfg = dataclasses.replace(EnvConfig().dr_cfg, curriculum=False)
+    env_cfg = EnvConfig(num_envs=args.num_envs, episode_length_s=args.duration, torch_compile=not args.no_compile, dr_cfg=dr_cfg)
     e = PayloadControlEnv(env_cfg=env_cfg, show_viewer=not args.headless, device="cuda")
 
     runner = OnPolicyRunner(e, train_cfg_dict, log_dir=None, device="cuda")
     runner.load(ckpt_path)
-    policy = runner.get_inference_policy(device=e.device)
+    policy = runner.get_inference_policy(device=e.device) # deterministic: actor mean, no action sampling
+
+    if not args.dr:
+        e.dr_level = 0.0 # nominal params, no init-state randomization
 
     n, dev = e.num_envs, e.device
     traj = Figure8(e.payload_init_pos, args.period, *args.amp, ramp_s=args.ramp, device=dev)
@@ -278,7 +290,8 @@ def main():
                 L = int(live_steps[i].item())
                 lag_s, shifted_err = estimate_lag(hist_pl[i, :L], hist_ref[i, :L], e.dt, args.max_lag)
                 if i == 0 and not plot_done:
-                    save_plot(plot_log, os.path.join(os.path.dirname(ckpt_path), "eval_tracking.png"), e.cfg.terminate_if_payload_tilt_greater_than)
+                    out = plots_dir(os.path.dirname(ckpt_path), os.path.splitext(os.path.basename(ckpt_path))[0]) # logs/<run>/plots/model_<iter>
+                    save_plot(plot_log, os.path.join(out, "eval_tracking.png"), e.cfg.terminate_if_payload_tilt_greater_than)
                     plot_done = True
                 ep = {
                     "return": ep_return[i].item(),
@@ -313,7 +326,8 @@ def main():
     v_peak = max(args.amp[0] * w, 2 * args.amp[1] * w, 0.5 * args.amp[2] * w)
     print("\n========== TRACKING EVAL SUMMARY ==========")
     print(f"checkpoint        : {ckpt_path}")
-    print(f"trajectory        : figure-8, period={args.period:.1f}s, amp={tuple(args.amp)} m, peak axis speed ~{v_peak:.2f} m/s, yaw={args.yaw_mode}")
+    print(f"system            : {'full domain randomization' if args.dr else 'nominal'}, seed={args.seed}")
+    print(f"trajectory       : figure-8, period={args.period:.1f}s, amp={tuple(args.amp)} m, peak axis speed ~{v_peak:.2f} m/s, yaw={args.yaw_mode}")
     print(f"episodes          : {len(results['return'])}")
     print(f"crash rate        : {res['crashed'].mean().item() * 100:.1f}%")
     print(f"return            : {res['return'].mean().item():.2f} +- {res['return'].std().nan_to_num().item():.2f}")

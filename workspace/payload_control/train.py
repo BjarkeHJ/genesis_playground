@@ -7,6 +7,7 @@ from env import *
 from utils import *
 from config_training import TrainConfig
 from config_env import EnvConfig
+from run_config import snapshot_configs
 
 def main():
     parser = argparse.ArgumentParser()
@@ -22,7 +23,7 @@ def main():
     if args.run == None:
         raise ValueError("Run argument is required - Add with --run <name>")
 
-    # gs.init(backend=gs.cuda, logging_level="warning")
+    # gs.init(backend=gs.cuda, performance_mode=True)
     gs.init(backend=gs.cuda, logging_level="warning", performance_mode=True)
 
     train_cfg = TrainConfig(run_name=args.run)
@@ -32,6 +33,7 @@ def main():
     e = PayloadControlEnv(env_cfg=env_cfg, show_viewer=not args.headless, device="cuda")
 
     log_dir = os.path.join(SCRIPT_DIR, "logs", train_cfg.run_name or "model")
+    snapshot_configs(log_dir) # eval scripts load these copies (run_config.use_run_configs)
     runner = OnPolicyRunner(e, train_cfg_dict, log_dir=log_dir, device="cuda")
 
     if args.resume:

@@ -4,10 +4,10 @@ from dataclasses import dataclass, field
 class PPOConfig:
     class_name: str = "PPO"
     clip_param: float = 0.2
-    desired_kl: float = 0.01
+    desired_kl: float = 0.005 # orig 0.01
     entropy_coef: float = 0.004
-    gamma: float = 0.995
-    lam: float = 0.95 
+    gamma: float = 0.998
+    lam: float = 0.97 
     learning_rate: float = 0.0003
     max_grad_norm: float = 1.0
     num_learning_epochs: int = 5
@@ -38,7 +38,7 @@ class CriticConfig:
 @dataclass
 class ObsGroupsConfig:
     actor: list[str] = field(default_factory=lambda: ["policy"])
-    critic: list[str] = field(default_factory=lambda: ["policy"])
+    critic: list[str] = field(default_factory=lambda: ["critic"]) # asynchronous actor-critic with critic-priviledged observations
 
 @dataclass
 class TrainConfig:
@@ -46,7 +46,7 @@ class TrainConfig:
     actor: ActorConfig = field(default_factory=ActorConfig)
     critic: CriticConfig = field(default_factory=CriticConfig)
     obs_groups: ObsGroupsConfig = field(default_factory=ObsGroupsConfig)
-    num_steps_per_env: int = 256
+    num_steps_per_env: int = 400
     save_interval: int = 100
     run_name: str = ""
     logger: str = "tensorboard"

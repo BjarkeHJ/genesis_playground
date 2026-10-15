@@ -1,3 +1,4 @@
+import math
 import torch
 import glob
 import re
@@ -16,6 +17,20 @@ def dataclass_to_dict(obj):
 # Random bounded sampling
 def gs_rand_float(lower, upper, shape, device):
     return (upper - lower) * torch.rand(size=shape, device=device) + lower
+
+def rand_uniform(rng, n, device):
+    return gs_rand_float(rng[0], rng[1], (n, ), device)
+
+def rand_log_uniform(rng, n, device):
+    return torch.exp(gs_rand_float(math.log(rng[0]), math.log(rng[1]), (n, ), device))
+
+def lerp(rng, lvl):
+    return (1.0 + lvl * (rng[0] - 1.0), 1.0 + lvl * (rng[1] - 1.0))
+
+def loglerp(rng, lvl):
+    return (rng[0] ** lvl, rng[1] ** lvl)
+
+
 
 # Resolving a model (.pt file)
 def resolve_ckpt(run_name, ckpt):

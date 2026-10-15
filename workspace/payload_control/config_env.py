@@ -10,6 +10,43 @@ REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
 DRONE_PATH = os.path.join(REPO_ROOT, "system_model", "Starling2MaxURDF", "model", "starling2max.urdf")
 PAYLOAD_PATH = os.path.join(REPO_ROOT, "system_model", "payload", "box", "box.urdf")
 
+# ====== DOMAIN RAND ======
+@dataclass(frozen=True)
+class DomainRandConfig:
+    enabled: bool = True
+    curriculum: bool = True # ramp one level 0 -> 1 that scales every enabled group's range (off: full range from the start)
+    groups: tuple[str, ...] = ("init", "yaw", "tether", "bodies", "actuation") # enabled groups; left out = nominal ("yaw" left out = full yaw_ref range)
+
+    # Tether
+    rest_length_scale: tuple[float, float] = (0.8, 1.2) # effective pendulum length != tether rest length
+    stiffness_scale: tuple[float, float] = (0.3, 3.0) # log-uniform
+    damping_scale: tuple[float, float] = (0.3, 3.0) # log-uniform
+    torsional_damping_scale: tuple[float, float] = (0.25, 4.0) # log-uniform
+
+    # Bodies
+    payload_mass_scale: tuple[float, float] = (0.8, 1.15)
+    drone_mass_scale: tuple[float, float] = (0.9, 1.1)
+
+    # Actuation
+    thrust_scale: tuple[float, float] = (0.85, 1.15) # KF / battery voltage
+    latency_s: tuple[float, float] = (0.0, 0.020) # [s] setpoint latency, rounded to whole sim steps (5 ms at sim_dt=5 ms)
+
+    # Initial state
+    init_swing_angle: float = math.radians(20.0)
+    init_swing_rate: float = 0.5
+    init_drone_vel: float = 0.5
+    init_rel_yaw: float = math.radians(10.0)
+
+    # Curriculum (if curriculum = True). After every level change one episode passes before success is measured again
+    curriculum_interval: int = 1200 # policy steps per success window
+    curriculum_step: float = 0.2 # level increase when success > curriculum_up (5 steps to full)
+    curriculum_step_down: float = 0.2 # level decrease when success < curriculum_down
+    curriculum_up: float = 0.8 # success rate to advance
+    curriculum_down: float = 0.5 # success rate to back off
+
+    curriculum_window_s: float = 3.0 # 150 policy steps
+    curriculum_pos_err: float = 0.25 # final payload pos error that counts as success (trained policy settles to ~0.05 m)
+
 # ====== TETHER CONFIG ======
 @dataclass(frozen=True)
 class SystemConfig:
@@ -17,12 +54,9 @@ class SystemConfig:
     num_tethers: int = 3
     stiffness: float = 1500.0
     damping: float = 200.0
-    torsional_damping: float = 2e-4 # suspension yaw friction on the drone-payload relative yaw rate [N·m·s/rad], ~3% of critical for the box payload
-    torsional_damping_scale_range: tuple[float, float] = (0.5, 2.0) # per-episode randomization factor (true value is uncertain)
-    rest_length: float = 2.0
-    diameter: float = 0.005
-    slack_transition_width: float = 0.1
-    activation_delta: float = field(init=False) # computed in post-init
+    torsional_damping: float = 2e-4 # suspension yaw friction on the drone-payload relative yaw rate [N·m·s/rad]
+    rest_length: float = 5.0
+    activation_delta: float = 0.2
 
     # Payload
     payload_init_z: float = 5.0
@@ -49,9 +83,9 @@ class SystemConfig:
 
     # Post-init computations of dependent parameters
     def __post_init__(self):
-        object.__setattr__(self, "activation_delta", max(self.slack_transition_width * self.rest_length, EPS))
         object.__setattr__(self, "payload_reset_pos", (0.0, 0.0, self.payload_init_z)) 
         object.__setattr__(self, "drone_reset_pos", (0.0, 0.0, self.payload_init_z + self.rest_length)) # start approx at suspension
+
 
 # ====== COMMAND CONFIG =======
 @dataclass(frozen=True)
@@ -62,7 +96,7 @@ class CommandConfig:
     pos_x_range: float = 3.0
     pos_y_range: float = 3.0
     pos_z_range: float = 2.0
-    yaw_range: float = math.radians(0.0) # yaw_ref around initial payload heading
+    yaw_range: float = math.radians(90.0) # yaw_ref around initial payload heading (full range, scaled by the curriculum level when "yaw" is in DomainRandConfig.groups)
 
 # ======= Observation Scales =======
 @dataclass(frozen=True)
@@ -75,7 +109,7 @@ class ObservationScales:
     vz: float = 1.0 / 6.0
     pl_body_rates: float = 1.0 / math.pi # size?
     pl_swing_angles: float = 1.0 / math.radians(60.0) # = 1 / terminate_if_swingangle_greater_than
-    pl_swing_angles_rates: float = 1.0 / 2.0 # measure?
+    pl_swing_angles_rates: float = 1.0 / 1.0 # measure?
     rel_yaw: float = 1.0 / (0.75 * math.pi) # = 1 / terminate_if_relyaw_greater_than
     drone_body_rates: float = 1.0 / math.pi
 
@@ -111,15 +145,16 @@ class EnvConfig:
     sys_cfg: SystemConfig = field(default_factory=SystemConfig)
     cmd_cfg: CommandConfig = field(default_factory=CommandConfig)
     rew_cfg: RewardConfig = field(default_factory=RewardConfig)
+    dr_cfg: DomainRandConfig = field(default_factory=DomainRandConfig)
     obs_scales: ObservationScales = field(default_factory=ObservationScales)
 
     # Physics engine
     num_envs: int = 1
 
     # Timing: policy runs every `decimation` sim steps; rate controller + tether model run every sim step
-    sim_dt: float = 0.0025 # physics / rate controller step [s]
+    sim_dt: float = 0.005 # physics / rate controller step [s] (200 Hz; real PX4 rate loop runs at IMU_GYRO_RATEMAX)
     sim_substeps: int = 1 # internal physics substeps per sim step
-    decimation: int = 8 # sim steps per policy step
+    decimation: int = 4 # sim steps per policy step
     dt: float = field(init=False) # policy step [s]
     torch_compile: bool = True # fuse the per-sim-step torch code (controllers, tethers); costs compile time at startup
 
@@ -132,7 +167,7 @@ class EnvConfig:
     clip_actions: float = 1.0
 
     # Terminate conditions
-    episode_length_s: float = 10.0
+    episode_length_s: float = 20.0
     terminate_if_payload_tilt_greater_than: float = math.pi / 4.0
     terminate_if_swingangle_greater_than: float = math.radians(60.0)
     terminate_if_x_greater_than: float = 7.0 # on pl pos err (bbox around target, heading frame)
@@ -145,6 +180,9 @@ class EnvConfig:
     # Post-init computations of dependent parameters
     def __post_init__(self):
         object.__setattr__(self, "dt", self.sim_dt * self.decimation)
+        # Latency is applied by holding the previous setpoint for the first sim steps of a policy step, so it caps at one policy step
+        if round(self.dr_cfg.latency_s[1] / self.sim_dt) > self.decimation:
+            raise ValueError(f"latency_s max {self.dr_cfg.latency_s[1]} s exceeds one policy step ({self.dt} s)")
 
 
 

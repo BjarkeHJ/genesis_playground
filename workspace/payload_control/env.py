@@ -93,6 +93,7 @@ class PayloadControlEnv:
                 constraint_solver=gs.constraint_solver.Newton,
                 enable_collision=True,
                 enable_joint_limit=False,
+                batch_links_info=True,
             ),
             show_viewer=self.show_viewer,
         )
@@ -143,7 +144,7 @@ class PayloadControlEnv:
 
         # Rate Controller
         self.gravity = abs(self.scene.sim.options.gravity[2])
-        max_motor_thrust = self.sys_cfg.twr_max * (self.drone.get_mass() + self.payload.get_mass()) * self.gravity / self.drone.n_propellers
+        max_motor_thrust = self.sys_cfg.twr_max * (self.drone.get_mass() + self.payload.get_mass()).flatten()[0].item() * self.gravity / self.drone.n_propellers
         rotors = rotors_from_genesis(
             self.drone,
             self.sys_cfg.propellers_link_name,
@@ -185,14 +186,42 @@ class PayloadControlEnv:
         self.min_cos_tilt = math.cos(self.sys_cfg.tilt_comp_max)
 
         # Initialized state
-        self.mass_eff = 1.0 / (1.0 / self.drone.get_mass() + 1.0 / self.payload.get_mass())
+        dr = self.cfg.dr_cfg
+        self.win_steps = int(dr.curriculum_window_s / self.dt)
+        self.win_err = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_float)
+
+        self.dr_level = 0.0 if dr.curriculum else 1.0 # scales every enabled group's range, see _dr_scale
+        self.cur_success = torch.zeros((), device=self.device)
+        self.cur_count = torch.zeros((), device=self.device)
+        self.cur_steps = 0
+        self.cur_start = 0 # policy step the current success window opened
+
+        self.payload_mass0 = self.payload.get_mass().flatten()[0].item() # get_mass() returns a tensor (scalar or per-env); nominal masses are identical across envs at build time
+        self.drone_mass0 = self.drone.get_mass().flatten()[0].item()
+        self.rest_length = torch.full((self.num_envs, ), self.sys_cfg.rest_length, device=self.device, dtype=gs.tc_float)
+        self.stiffness = torch.full((self.num_envs, ), self.sys_cfg.stiffness, device=self.device, dtype=gs.tc_float)
+        self.damping = torch.full((self.num_envs, ), self.sys_cfg.damping, device=self.device, dtype=gs.tc_float)
+        self.payload_mass = torch.full((self.num_envs, ), self.payload_mass0, device=self.device, dtype=gs.tc_float)
+        self.drone_mass = torch.full((self.num_envs, ), self.drone_mass0, device=self.device, dtype=gs.tc_float)
+        self.mass_eff = 1.0 / (1.0 / self.drone_mass + 1.0 / self.payload_mass)
+        self.g_eff = (1.0 + self.payload_mass / self.drone_mass) * self.gravity
+        self.rpm_scale = torch.ones((self.num_envs, ), device=self.device, dtype=gs.tc_float)
+        self.latency_steps = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_int)
+        # Latency range in sim steps. Config snapshots from before latency_s give it in sim steps directly
+        dr_cfg = self.cfg.dr_cfg
+        if hasattr(dr_cfg, "latency_s"):
+            self.latency_range_steps = tuple(round(s / self.sim_dt) for s in dr_cfg.latency_s)
+        else:
+            self.latency_range_steps = tuple(dr_cfg.latency_sim_steps)
+        self.latency_max_steps = max(self.latency_range_steps[1], 1) # privileged obs normalization: max latency -> 1
+        self.prev_sp = torch.zeros((self.num_envs, 4), device=self.device, dtype=gs.tc_float)
+
         self.drone_init_pos = torch.tensor(self.sys_cfg.drone_reset_pos, device=self.device, dtype=gs.tc_float)
         self.drone_init_quat = torch.tensor(self.sys_cfg.drone_reset_quat, device=self.device, dtype=gs.tc_float)
         self.payload_init_pos = torch.tensor(self.sys_cfg.payload_reset_pos, device=self.device, dtype=gs.tc_float)
         self.payload_init_quat = torch.tensor(self.sys_cfg.payload_reset_quat, device=self.device, dtype=gs.tc_float)
         self.world_up = torch.tensor([0.0, 0.0, 1.0], device=self.device, dtype=gs.tc_float).expand(self.num_envs, -1) # body z-axis for thrust axis
         self.world_down = -self.world_up # gravity direction for projected gravity
-        self.g_eff = (1.0 + self.payload.get_mass() / self.drone.get_mass()) * self.gravity # Swing-mode effective gravity |F|/M_drone, hover approximation F = (M + m) g
 
         s = self.cfg.obs_scales
         self.pos_obs_scale = torch.tensor([s.px, s.py, s.pz], device=self.device, dtype=gs.tc_float)
@@ -246,82 +275,107 @@ class PayloadControlEnv:
         self.reset()
 
     def get_observations(self):
-        return TensorDict({"policy": self.obs_buf}, batch_size=[self.num_envs])
+        priv = torch.stack([
+            self.rest_length / self.sys_cfg.rest_length - 1.0,
+            torch.log(self.stiffness / self.sys_cfg.stiffness),
+            torch.log(self.damping / self.sys_cfg.damping),
+            torch.log(self.torsional_damping / self.sys_cfg.torsional_damping),
+            self.payload_mass / self.payload_mass0 - 1.0,
+            self.drone_mass / self.drone_mass0 - 1.0,
+            self.rpm_scale**2 - 1.0,
+            self.latency_steps.float() / self.latency_max_steps,
+        ], dim=-1)
+
+        return TensorDict({
+            "policy": self.obs_buf, # noisy
+            "critic": torch.cat([self.obs_buf, priv], dim=-1), # clean + priv obs
+        }, batch_size=[self.num_envs])
 
     def reset_idx(self, envs_idx):
         self.extras["episode"] = {} # cleared every step so rsl_rl never re-logs stale values
         if len(envs_idx) == 0:
             return
-        n = len(envs_idx)
 
         for name, ep_sum in self.episode_sums.items():
             self.extras["episode"][f"Episode_Reward/{name}"] = torch.mean(ep_sum[envs_idx]) / self.cfg.episode_length_s
             ep_sum[envs_idx] = 0.0
+        self.extras["episode"]["Curriculum/level"] = self.dr_level
 
+        # Sample random tether parameters
+        self._randomize_system_params(envs_idx)
+
+        # Sample initial state
+        drone_pos, drone_quat, drone_vel, payload_pos, payload_quat, payload_vel = self._sample_initial_state(envs_idx)
+        
         # Reset drone
-        drone_quat0 = self.drone_init_quat.expand(n, -1)
-        self.drone.set_pos(self.drone_init_pos.expand(n, -1), zero_velocity=True, envs_idx=envs_idx)
-        self.drone.set_quat(drone_quat0, zero_velocity=True, envs_idx=envs_idx)
+        self.drone.set_pos(drone_pos, zero_velocity=True, envs_idx=envs_idx)
+        self.drone.set_quat(drone_quat, zero_velocity=True, envs_idx=envs_idx)
+        self.drone.set_dofs_velocity(drone_vel, dofs_idx_local=[0,1,2], envs_idx=envs_idx)
         
         # Reset payload
-        payload_quat0 = self.payload_init_quat.expand(n, -1)
-        self.payload.set_pos(self.payload_init_pos.expand(n, -1), zero_velocity=True, envs_idx=envs_idx)
-        self.payload.set_quat(payload_quat0, zero_velocity=True, envs_idx=envs_idx)
+        self.payload.set_pos(payload_pos, zero_velocity=True, envs_idx=envs_idx)
+        self.payload.set_quat(payload_quat, zero_velocity=True, envs_idx=envs_idx)
+        self.payload.set_dofs_velocity(payload_vel, dofs_idx_local=[0,1,2], envs_idx=envs_idx)
 
-        # Suspension yaw damping (uncertain physical value)
-        lo, hi = self.sys_cfg.torsional_damping_scale_range
-        self.torsional_damping[envs_idx] = self.sys_cfg.torsional_damping * gs_rand_float(lo, hi, shape=(n, ), device=self.device)
+        # Reset controller
+        self.rate_ctrl.reset(envs_idx, thrust_sp=self.hover_thrust) # hover after reset
+        self.att_ctrl.reset(envs_idx, quat=drone_quat) # yaw setpoint = current heading
 
         # Commands (yaw_ref sampled relative to the reset payload heading)
-        payload_yaw0 = quat_yaw(payload_quat0)
+        payload_yaw0 = quat_yaw(payload_quat)
         self._resample_commands(envs_idx, payload_yaw0)
 
-        # Reset internal state (at rest)
-        self.drone_yaw[envs_idx] = quat_yaw(drone_quat0)
-        self.payload_pos_err[envs_idx] = rotate_to_heading(self.commands[envs_idx, :3] - self.payload.get_pos(envs_idx), self.drone_yaw[envs_idx])
-        self.payload_vel[envs_idx] = 0.0
-        self.payload_proj_g[envs_idx] = transform_by_quat(self.world_down[envs_idx], inv_quat(payload_quat0))
-        self.payload_body_rates[envs_idx] = 0.0
-        self.payload_swing_angles[envs_idx] = 0.0
-        self.payload_swing_angles_rates[envs_idx] = 0.0
-        self.drone_proj_g[envs_idx] = transform_by_quat(self.world_down[envs_idx], inv_quat(drone_quat0))
-        self.drone_body_rates[envs_idx] = 0.0
-        self.drone_payload_rel_yaw[envs_idx] = wrap_angle(payload_yaw0 - self.drone_yaw[envs_idx])
-        self.payload_yaw_err[envs_idx] = wrap_angle(self.commands[envs_idx, 3] - payload_yaw0)
-
-        self.swing_amp[envs_idx] = 0.0
+        # Previous controller setpoint (action policy latency)
+        self.prev_sp[envs_idx] = torch.tensor([self.hover_thrust, 0.0, 0.0, 0.0], device=self.device, dtype=gs.tc_float)
+        self.win_err[envs_idx] = 0.0
 
         self.actions[envs_idx] = 0
         self.prev_actions[envs_idx] = 0
         self.episode_length_buf[envs_idx] = 0
         self.crash_condition[envs_idx] = 0
-        self.rate_ctrl.reset(envs_idx, thrust_sp=self.hover_thrust) # hover after reset
-        self.att_ctrl.reset(envs_idx, quat=drone_quat0) # yaw setpoint = current heading
+
 
     def reset(self):
         self.reset_buf[:] = True
         self.reset_idx(torch.arange(self.num_envs, device=self.device))
+        self._update_buffers()
         self._update_observations()
         return self.get_observations()
 
     def step(self, actions):
         self.actions_raw = actions # pre-clip policy sample, for the action bound penalty
         self.actions = torch.clip(actions, -self.cfg.clip_actions, self.cfg.clip_actions) # [-1; 1]
-        thrust_sp, roll_sp, pitch_sp, yawrate_sp = self._scale_actions(self.actions)
+
+        # thrust_sp, roll_sp, pitch_sp, yawrate_sp = self._scale_actions(self.actions)
+        sp = torch.stack(self._scale_actions(self.actions), dim=-1) # (N, 4)
 
         # Setpoints held constant (zero-order hold) while the inner loop runs at sim rate
         # Viewer refreshed on the last substep only (policy rate), see _attach_viewer_logs for the matching pacing
         for i in range(self.decimation):
+            late = (i < self.latency_steps).unsqueeze(-1)
+            thrust_sp, roll_sp, pitch_sp, yawrate_sp = torch.where(late, self.prev_sp, sp).unbind(-1)
             self._sim_step(thrust_sp, roll_sp, pitch_sp, yawrate_sp, update_visualizer=(i == self.decimation - 1))
+        self.prev_sp = sp
+
+        self.episode_length_buf += 1
 
         self._update_buffers()
         self._update_crash_conditions()
         self._compute_reward()
-        self.reset_idx(self.reset_buf.nonzero(as_tuple=False).reshape((-1, )))
-        
-        self._update_observations()
 
+        # Curriculum success: episode survived to timeout with the payload near the target (terminal state, before reset)
+        in_win = (self.episode_length_buf > self.max_episode_length - self.win_steps).float()
+        self.win_err += in_win * torch.norm(self.payload_pos_err, dim=1)
+        success = self.reset_buf & ~self.crash_condition & (self.win_err / self.win_steps < self.cfg.dr_cfg.curriculum_pos_err)
+        self.cur_success += success.sum()
+        self.cur_count += self.reset_buf.sum()
+
+        self.reset_idx(self.reset_buf.nonzero(as_tuple=False).reshape((-1, )))
+        self._update_buffers() # update again to catch initial states (cheap but could be guarded)
+        self._update_observations()
         self.prev_actions = self.actions
+
+        self._update_curriculum()
 
         return self.get_observations(), self.rew_buf, self.reset_buf, self.extras
 
@@ -353,7 +407,7 @@ class PayloadControlEnv:
         # Get motor RPM from ratecontroller/mixer
         rate_sp = self._att_ctrl_update(drone_quat, roll_sp, pitch_sp, yawrate_sp)
         rpms = self._rate_ctrl_update(thrust_sp, rate_sp, drone_body_rates)
-        self.drone.set_propellers_rpm(rpms)
+        self.drone.set_propellers_rpm(rpms * self.rpm_scale[:, None])
 
         # Step tether model
         self._tethers_step()
@@ -368,14 +422,17 @@ class PayloadControlEnv:
         vel = self.rigid_solver.get_links_vel(self.tether_links_idx, relative=True)
         force_on_drone = self._tether_forces(
             pos[:, :n], vel[:, :n], pos[:, n:], vel[:, n:],
-            self.sys_cfg.rest_length, self.sys_cfg.activation_delta, self.sys_cfg.stiffness, self.sys_cfg.damping, self.mass_eff, self.sim_dt,
+            self.rest_length[:, None], self.sys_cfg.activation_delta, self.stiffness[:, None], self.damping[:, None],
+            self.mass_eff[:, None], self.sim_dt,
         )
         torque = self._tether_torques(pos[:, :n], vel[:, :n], pos[:, n:], vel[:, n:], self.torsional_damping)
-        self.rigid_solver.apply_links_external_wrench(force=torch.cat([force_on_drone, -force_on_drone], dim=1), torque=torque, links_idx=self.tether_links_idx)
+        self.rigid_solver.apply_links_external_wrench(
+            force=torch.cat([force_on_drone, -force_on_drone], dim=1),
+            torque=torque,
+            links_idx=self.tether_links_idx,
+        )
 
     def _update_buffers(self):
-        self.episode_length_buf += 1
-
         # Drone attitude (heading frame defined by drone yaw)
         drone_quat = self.drone.get_quat()
         drone_inv_quat = inv_quat(drone_quat)
@@ -465,7 +522,39 @@ class PayloadControlEnv:
             ],
             axis=1
         )
-    
+
+    def _update_curriculum(self):
+        dr = self.cfg.dr_cfg
+        self.cur_steps += 1
+        if self.cur_steps == self.cur_start: # window opens: drop episodes counted while the previous one settled
+            self.cur_success.zero_()
+            self.cur_count.zero_()
+        if self.cur_steps < self.cur_start + dr.curriculum_interval or self.cur_count.item() == 0:
+            return
+        rate = (self.cur_success / self.cur_count).item()
+        self.cur_success.zero_()
+        self.cur_count.zero_()
+        self.cur_start = self.cur_steps
+        self.extras["episode"]["Curriculum/success_rate"] = rate # logged without curriculum too, for comparison
+        if not (dr.enabled and dr.curriculum):
+            return
+        if rate > dr.curriculum_up and self.dr_level < 1.0:
+            self.dr_level = round(min(1.0, self.dr_level + dr.curriculum_step), 6) # round: no float drift in the logged level
+        elif rate < dr.curriculum_down and self.dr_level > 0.0:
+            self.dr_level = round(max(0.0, self.dr_level - dr.curriculum_step_down), 6)
+        else:
+            return
+        # Level changed: skip one episode length so the next window only sees episodes started at the new level
+        self.cur_start = self.cur_steps + self.max_episode_length
+
+    def _dr_scale(self, group):
+        # Range scale of a randomization group: the curriculum level if enabled, else nominal (0).
+        # "yaw" is the task's yaw_ref range rather than a randomization, so it is full (1) unless ramped
+        dr = self.cfg.dr_cfg
+        if dr.enabled and group in dr.groups:
+            return self.dr_level
+        return 1.0 if group == "yaw" else 0.0
+
     def _resample_commands(self, envs_idx, payload_yaw0, n=1):
         if len(envs_idx) == 0:
             return
@@ -474,9 +563,67 @@ class PayloadControlEnv:
         self.commands[envs_idx, 0] = gs_rand_float(pl_init[0] - self.cmd_cfg.pos_x_range, pl_init[0] + self.cmd_cfg.pos_x_range, shape=(len(envs_idx), ), device=self.device)
         self.commands[envs_idx, 1] = gs_rand_float(pl_init[1] - self.cmd_cfg.pos_y_range, pl_init[1] + self.cmd_cfg.pos_y_range, shape=(len(envs_idx), ), device=self.device)
         self.commands[envs_idx, 2] = gs_rand_float(pl_init[2] - self.cmd_cfg.pos_z_range, pl_init[2] + self.cmd_cfg.pos_z_range, shape=(len(envs_idx), ), device=self.device)
-        self.commands[envs_idx, 3] = wrap_angle(payload_yaw0 + gs_rand_float(-self.cmd_cfg.yaw_range, self.cmd_cfg.yaw_range, shape=(len(envs_idx), ), device=self.device))
+        yaw_max = self._dr_scale("yaw") * self.cmd_cfg.yaw_range
+        self.commands[envs_idx, 3] = wrap_angle(payload_yaw0 + gs_rand_float(-yaw_max, yaw_max, shape=(len(envs_idx), ), device=self.device))
 
         self._draw_target(envs_idx)
+
+    def _randomize_system_params(self, envs_idx):
+        dr, n, L0 = self.cfg.dr_cfg, len(envs_idx), self.sys_cfg.rest_length
+
+        tether_lvl = self._dr_scale("tether")
+        L = L0 * rand_uniform(lerp(dr.rest_length_scale, tether_lvl), n, self.device)
+        self.rest_length[envs_idx] = L
+
+        # Rope axial stiffness is EA/L: a longer rope is softer
+        self.stiffness[envs_idx] = self.sys_cfg.stiffness * (L0 / L) * rand_log_uniform(loglerp(dr.stiffness_scale, tether_lvl), n, self.device)
+        self.damping[envs_idx] = self.sys_cfg.damping * rand_log_uniform(loglerp(dr.damping_scale, tether_lvl), n, self.device)
+        self.torsional_damping[envs_idx] = self.sys_cfg.torsional_damping * rand_log_uniform(loglerp(dr.torsional_damping_scale, tether_lvl), n, self.device)
+
+        # Masses
+        bodies_lvl = self._dr_scale("bodies")
+        pm = self.payload_mass0 * rand_uniform(lerp(dr.payload_mass_scale, bodies_lvl), n, self.device)
+        dm = self.drone_mass0 * rand_uniform(lerp(dr.drone_mass_scale, bodies_lvl), n, self.device)
+        self.payload_mass[envs_idx] = pm
+        self.drone_mass[envs_idx] = dm
+        self.mass_eff[envs_idx] = 1.0 / (1.0 / dm + 1.0 / pm)
+        self.g_eff[envs_idx] = (1.0 + pm / dm) * self.gravity
+        self.payload.set_mass(pm, envs_idx=envs_idx)
+        self.drone.set_mass(dm, envs_idx=envs_idx)
+
+        # Actuation
+        actuation_lvl = self._dr_scale("actuation")
+        self.rpm_scale[envs_idx] = torch.sqrt(rand_uniform(lerp(dr.thrust_scale, actuation_lvl), n, self.device))
+        lo, hi = self.latency_range_steps
+        self.latency_steps[envs_idx] = torch.randint(lo, round(lo + actuation_lvl * (hi - lo)) + 1, (n, ), device=self.device, dtype=gs.tc_int)
+
+    def _sample_initial_state(self, envs_idx):
+        dr, n = self.cfg.dr_cfg, len(envs_idx)
+        
+        init_lvl = self._dr_scale("init")
+        L = self.rest_length[envs_idx]
+
+        # Swing: r = drone->payload, built so atan2(r_x, -r_z) = theta_x
+        th = gs_rand_float(-dr.init_swing_angle * init_lvl, dr.init_swing_angle * init_lvl, (n, 2), self.device)
+        r_hat = torch.stack([torch.tan(th[:, 0]), torch.tan(th[:, 1]), -torch.ones_like(L)], dim=-1)
+        r_hat = r_hat / torch.norm(r_hat, dim=-1, keepdim=True)
+        payload_pos = self.payload_init_pos.expand(n, -1)
+        attach_dz = 0.045
+        drone_pos = payload_pos - r_hat * (L + attach_dz + 0.01).unsqueeze(-1) # slightly taut
+
+        # Heading
+        yaw_d = gs_rand_float(-math.pi, math.pi, (n, ), self.device)
+        yaw_p = yaw_d + gs_rand_float(-dr.init_rel_yaw * init_lvl, dr.init_rel_yaw * init_lvl, (n, ), self.device)
+        yaw_quat = lambda y: torch.stack([torch.cos(y/2), torch.zeros_like(y), torch.zeros_like(y), torch.sin(y/2)], dim=-1)
+
+        # Velocities
+        v_d = dr.init_drone_vel * init_lvl * torch.randn((n, 3), device=self.device)
+        u = torch.randn((n, 3), device=self.device)
+        u = u - (u * r_hat).sum(-1, keepdim=True) * r_hat
+        v_rel = u / torch.clamp(torch.norm(u, dim=-1, keepdim=True), min=EPS) * (dr.init_swing_rate * init_lvl * L).unsqueeze(-1) * torch.rand((n, 1), device=self.device)
+        v_p = v_d + v_rel
+
+        return drone_pos, yaw_quat(yaw_d), v_d, payload_pos, yaw_quat(yaw_p), v_p
 
     def _draw_target(self, envs_idx):
         # Viewer-only target from env 0's command: sphere at [x, y, z], arrow along yaw_ref pointing outward from the sphere
@@ -538,7 +685,6 @@ class PayloadControlEnv:
         # quadratic inside so the pull fades near zero instead of driving bang-bang yaw commands
         d = self.rew_cfg.delta_yaw
         yaw_rew = (torch.sqrt(torch.square(self.payload_yaw_err) + d**2) - d) * self.rew_cfg.w_yaw
-        # yaw_rew = (torch.pi - (torch.sqrt(torch.square(self.payload_yaw_err) + d**2) - d)) * self.rew_cfg.w_yaw
         return yaw_rew
 
     def _reward_yaw_damping(self):
