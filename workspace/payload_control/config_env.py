@@ -14,7 +14,7 @@ PAYLOAD_PATH = os.path.join(REPO_ROOT, "system_model", "payload", "box", "box.ur
 @dataclass(frozen=True)
 class DomainRandConfig:
     enabled: bool = True
-    curriculum: bool = True # ramp one level 0 -> 1 that scales every enabled group's range (off: full range from the start)
+    curriculum: bool = False # ramp one level 0 -> 1 that scales every enabled group's range (off: full range from the start)
     groups: tuple[str, ...] = ("init", "yaw", "tether", "bodies", "actuation") # enabled groups; left out = nominal ("yaw" left out = full yaw_ref range)
 
     # Tether
