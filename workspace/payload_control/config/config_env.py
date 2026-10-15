@@ -1,20 +1,14 @@
-import os
 from dataclasses import dataclass, field
 import math
 from system_model.utils.qc_rate_control import RateControlParams, MotorPlantParams
 from system_model.utils.qc_attitude_control import AttitudeControlParams
 
 EPS = 1e-9
-SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
-DRONE_PATH = os.path.join(REPO_ROOT, "system_model", "Starling2MaxURDF", "model", "starling2max.urdf")
-PAYLOAD_PATH = os.path.join(REPO_ROOT, "system_model", "payload", "box", "box.urdf")
 
 # ====== DOMAIN RAND ======
 @dataclass(frozen=True)
 class DomainRandConfig:
     enabled: bool = True
-    groups: tuple[str, ...] = ("init", "yaw", "tether", "bodies", "actuation") # enabled groups; left out = nominal ("yaw" left out = full yaw_ref range)
 
     # Tether
     rest_length_scale: tuple[float, float] = (0.8, 1.2) # effective pendulum length != tether rest length
@@ -90,7 +84,7 @@ class CommandConfig:
     pos_x_range: float = 3.0
     pos_y_range: float = 3.0
     pos_z_range: float = 2.0
-    yaw_range: float = math.radians(90.0) # yaw_ref around initial payload heading (scaled by the env's dr_level when "yaw" is in DomainRandConfig.groups)
+    yaw_range: float = math.radians(90.0) # yaw_ref around initial payload heading
 
 # ======= Observation Scales =======
 @dataclass(frozen=True)

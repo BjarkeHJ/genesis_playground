@@ -4,10 +4,10 @@ import genesis as gs
 from rsl_rl.runners import OnPolicyRunner
 
 from env import *
-from utils import *
-from config_training import TrainConfig
-from config_env import EnvConfig
-from run_config import snapshot_configs
+from config.config_training import TrainConfig
+from config.config_env import EnvConfig
+from config.paths import LOG_DIR
+from config.run_config import snapshot_configs, resolve_ckpt, dataclass_to_dict
 
 def main():
     parser = argparse.ArgumentParser()
@@ -32,7 +32,7 @@ def main():
     env_cfg = EnvConfig(num_envs=args.num_envs)
     e = PayloadControlEnv(env_cfg=env_cfg, show_viewer=not args.headless, device="cuda")
 
-    log_dir = os.path.join(SCRIPT_DIR, "logs", train_cfg.run_name or "model")
+    log_dir = os.path.join(LOG_DIR, train_cfg.run_name or "model")
     snapshot_configs(log_dir) # eval scripts load these copies (run_config.use_run_configs)
     runner = OnPolicyRunner(e, train_cfg_dict, log_dir=log_dir, device="cuda")
 

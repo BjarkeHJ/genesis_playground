@@ -6,8 +6,20 @@ import math
 import numpy as np
 
 from plot_utils import (plt, cfg, rw, STEPS_PER_S, INK, INK2, MUTED, SURF, LW, apply_style, parse_run_args, save_figure)
-from plot_training_terms import PENALTIES, C_TRACK, C_CRASH
 
+PENALTIES = [ # (tag, label, colour, dash) -- dashes double-encode identity, three hues sit below 3:1 on the surface
+    ("damping", "damping near target", "#eb6834", "-"),
+    ("swing_energy", "swing energy", "#1baf7a", (0, (6, 3))),
+    ("yaw_error", "payload yaw err", "#eda100", (0, (2, 2))),
+    ("yaw_damping", "yaw damping near target", "#8a6d00", (0, (8, 2, 1, 2))),
+    ("tilt", "payload tilt", "#e87ba4", (0, (6, 2, 2, 2))),
+    ("vmax", "overspeed", "#008300", (0, (1, 3))),
+    ("smooth_actions", "action smoothness", "#4a3aa7", (0, (10, 3))),
+    ("action_bound", "action bound", "#52514e", (0, (3, 1, 1, 1))),
+    ("yaw", "payload yaw (older runs)", "#eda100", (0, (2, 2))), # tag before the yaw_error rename; absent in new runs
+]
+
+C_CRASH = "#2a78d6"
 C = {tag: (col, ls) for tag, _, col, ls in PENALTIES} # same colour per term as the training figures
 BLUE_RAMP = ["#86b6ef", "#3987e5", "#1c5cab"]   # panel a (ordinal)
 ORANGE_RAMP = ["#f0a07c", "#eb6834", "#a8401a"] # panel b (ordinal: payload speed)

@@ -1,52 +1,45 @@
-import math
-import torch
-import glob
-import re
-import os
-import time
-
-from dataclasses import asdict, is_dataclass
+import genesis.utils.geom as gu
 from genesis.vis.viewer_plugins import ViewerPlugin
-from config_env import SCRIPT_DIR
 
-# Helper converting dataclass to python dict - Used for converting TrainingConfig to dict as expected by RSL_RL
-def dataclass_to_dict(obj):
-    assert is_dataclass(obj) and not isinstance(obj, type), f"{type(obj).__name__} is not a dataclass instance"
-    return asdict(obj)
+import math
+import time
+import numpy as np
+import torch
 
-# Random bounded sampling
-def gs_rand_float(lower, upper, shape, device):
-    return (upper - lower) * torch.rand(size=shape, device=device) + lower
+# Viewer-only helpers. The viewer renders env 0, so everything here shows env 0 (rendered_envs_idx in the scene setup)
 
-def rand_uniform(rng, n, device):
-    return gs_rand_float(rng[0], rng[1], (n, ), device)
+class TargetMarker:
+    # Debug target for a command [x, y, z, yaw_ref]: sphere at the position, arrow along yaw_ref pointing outward from it
+    def __init__(self, scene, radius=0.05, arrow_len=0.3):
+        self.scene = scene
+        self.radius = radius
+        self.arrow_len = arrow_len
+        self.objs = [] # [sphere, arrow], drawn on the first update
 
-def rand_log_uniform(rng, n, device):
-    return torch.exp(gs_rand_float(math.log(rng[0]), math.log(rng[1]), (n, ), device))
+    def update(self, command):
+        pos = command[:3].cpu().numpy().astype(np.float32)
+        yaw_ref = command[3].item()
+        heading = np.array([math.cos(yaw_ref), math.sin(yaw_ref), 0.0], dtype=np.float32)
+        arrow_pos = pos + self.radius * heading
 
-def lerp(rng, lvl):
-    return (1.0 + lvl * (rng[0] - 1.0), 1.0 + lvl * (rng[1] - 1.0))
+        if not self.objs:
+            self.objs = [
+                self.scene.draw_debug_sphere(pos=pos.tolist(), radius=self.radius, color=(1.0, 0.0, 0.0, 1.0)),
+                self.scene.draw_debug_arrow(pos=arrow_pos.tolist(), vec=(self.arrow_len * heading).tolist(), radius=0.008, color=(0.0, 0.0, 0.0, 1.0)),
+            ]
+            return
+        # Move the existing nodes: clearing and re-drawing every step rebuilds meshes under the viewer lock (~40% of sim rate)
+        self.scene.update_debug_objects(self.objs, (gu.trans_to_T(pos), gu.trans_R_to_T(arrow_pos, gu.z_up_to_R(heading))))
 
-def loglerp(rng, lvl):
-    return (rng[0] ** lvl, rng[1] ** lvl)
-
-
-
-# Resolving a model (.pt file)
-def resolve_ckpt(run_name, ckpt):
-    # Explicit path wins; otherwise pick model_<ckpt>.pt (or the latest one) from logs/<run_name>
-    if ckpt is not None and os.path.isfile(ckpt):
-        return ckpt
-    log_dir = os.path.join(SCRIPT_DIR, "logs", run_name)
-    if ckpt is not None:
-        path = os.path.join(log_dir, f"model_{ckpt}.pt")
-        if not os.path.isfile(path):
-            raise FileNotFoundError(f"Checkpoint not found: {path}")
-        return path
-    ckpts = glob.glob(os.path.join(log_dir, "model_*.pt"))
-    if not ckpts:
-        raise FileNotFoundError(f"No model_*.pt checkpoints in {log_dir}")
-    return max(ckpts, key=lambda p: int(re.search(r"model_(\d+)\.pt", p).group(1)))
+def attach_viewer_logs(env):
+    # The viewer paces one sim_dt per update, but env.step() updates it once per decimation substeps: scale to stay real time
+    env.scene.viewer.realtime_factor = env.decimation
+    # Text overlay of env 0 state. Buffers are heading frame
+    attach_sim_rate(env.scene)
+    attach_log(env.scene, "|pos err| [m]", lambda: torch.norm(env.payload_pos_err, dim=1))
+    attach_log(env.scene, "payload |v| [m/s]", lambda: torch.norm(env.payload_vel, dim=1))
+    attach_log(env.scene, "payload yaw error [deg]", lambda: torch.rad2deg(env.payload_yaw_err))
+    attach_log(env.scene, "reward", lambda: env.rew_buf, fmt="{:+.3f}")
 
 # Viewer text overlay - Lines of live values for one env, drawn in the bottom-left corner of the viewer
 # (top-left holds the viewer help text). font_pt < 22 crashes the pyrender font loader on 1-pixel-tall glyphs ('-', '.')
@@ -119,4 +112,3 @@ class SimRateMeter:
 def attach_sim_rate(scene, window_s=0.5):
     # Overlay line with the measured physics steps/s and the real-time factor (sim seconds per wall second)
     return attach_log(scene, "sim rate", SimRateMeter(scene, window_s), fmt="{}")
-

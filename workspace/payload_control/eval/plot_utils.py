@@ -14,9 +14,9 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 PC_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__))) # payload_control/
 LOG_DIR = os.path.join(PC_DIR, "logs")
 sys.path.insert(0, PC_DIR)
-from run_config import use_run_configs, plots_dir  # noqa: E402
+from config.run_config import use_run_configs, plots_dir  # noqa: E402
 use_run_configs()  # logs/<--run>/config when given, else the current configs
-from config_env import EnvConfig  # noqa: E402
+from config.config_env import EnvConfig  # noqa: E402
 
 cfg = EnvConfig()
 rw = cfg.rew_cfg

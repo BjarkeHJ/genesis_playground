@@ -9,7 +9,7 @@ from matplotlib.transforms import blended_transform_factory
 
 from plot_utils import (plt, cfg, rw, STEPS_PER_S, INK, INK2, MUTED, LW, apply_style, load_scalars, require,
                         plot_raw_ema, parse_run_args, run_dir, save_figure)
-from config_training import PPOConfig
+from config.config_training import PPOConfig
 
 ppo = PPOConfig()
 LR_MIN, LR_MAX = 1e-5, 1e-2 # rsl_rl's adaptive-schedule clamps (algorithms/ppo.py)

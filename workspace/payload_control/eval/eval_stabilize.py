@@ -6,15 +6,15 @@ import torch
 import genesis as gs
 from rsl_rl.runners import OnPolicyRunner
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__)))) # payload_control/ (env, utils, configs)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__)))) # payload_control/ (env, components, config)
 
-from run_config import use_run_configs, plots_dir
+from config.run_config import use_run_configs, plots_dir, resolve_ckpt, dataclass_to_dict
 use_run_configs() # logs/<--run>/config in place of the current configs -- must precede env/utils imports
 
 from env import *
-from utils import *
-from config_training import TrainConfig
-from config_env import EnvConfig
+from components.math_utils import gs_rand_float
+from config.config_training import TrainConfig
+from config.config_env import EnvConfig
 
 # Disturbance-rejection eval: the target is the nominal hover point (payload hanging straight below the drone at spawn),
 # and every episode starts with the system knocked out of equilibrium:
@@ -242,7 +242,7 @@ def main():
     policy = runner.get_inference_policy(device=e.device) # deterministic: actor mean, no action sampling
 
     if not args.dr:
-        e.dr_level = 0.0 # nominal params, no init-state randomization
+        e.dr.enabled = False # nominal params, no init-state randomization
 
     n, dev = e.num_envs, e.device
     settle_swing = math.radians(args.settle_swing_deg)

@@ -1,64 +1,23 @@
 import genesis as gs
-from genesis.utils.geom import transform_by_quat, inv_quat
-import genesis.utils.geom as gu
 
 import torch
 import math
-import numpy as np
 from tensordict import TensorDict
 
-from system_model.utils.qc_rate_control import QCRateController, rotors_from_genesis
-from system_model.utils.qc_attitude_control import QCAttitudeController, quat_yaw
-from config_env import *
-from utils import *
+from system_model.utils.qc_attitude_control import quat_yaw
+from config.config_env import *
+from config.paths import DRONE_PATH, PAYLOAD_PATH
+from components.math_utils import rotate_to_heading, wrap_angle, rotate_by_quat, gs_rand_float
+from components.tether import TetherModel
+from components.flight_control import FlightController
+from components.domain_rand import DomainRandomizer
+from components.rewards import RewardsMixin
+from components.viewer import TargetMarker, attach_viewer_logs
 
-def rotate_to_heading(v, yaw):
-    # World ENU vector -> heading frame: rotate by -yaw about world z. Gravity stays on z, no tilt involved
-    c, s = torch.cos(yaw), torch.sin(yaw)
-    return torch.stack([c * v[:, 0] + s * v[:, 1], -s * v[:, 0] + c * v[:, 1], v[:, 2]], dim=-1)
-
-def wrap_angle(a):
-    # Wrap to (-pi, pi]
-    return torch.atan2(torch.sin(a), torch.cos(a))
-
-def tether_forces(drone_attach_pos, drone_attach_vel, payload_attach_pos, payload_attach_vel, rest_length, activation_delta, stiffness, damping, mass_eff, dt):
-    # Tension-force model per tether -> force on the drone attach points (payload gets the opposite)
-    vec = payload_attach_pos - drone_attach_pos
-    vec_len = torch.linalg.norm(vec, dim=-1)
-    uhat = vec / torch.clamp(vec_len, min=EPS).unsqueeze(-1)
-
-    extension = vec_len - rest_length
-    activation = torch.tanh(extension / activation_delta)
-    extension_rate = ((payload_attach_vel - drone_attach_vel) * uhat).sum(dim=-1)
-
-    damping_impl = damping + dt * stiffness
-    extension_rate_impl = (mass_eff * extension_rate - dt * stiffness * extension) / (mass_eff + dt * damping_impl)
-    tension = activation * (stiffness * extension + damping_impl * extension_rate_impl)
-    tension = torch.where(vec_len > rest_length, tension, torch.zeros_like(tension))
-    tension = torch.clamp(tension, min=0.0)
-
-    return tension.unsqueeze(-1) * uhat
-
-def points_yaw_rate(pos, vel):
-    # World-z rotation rate of a rigid body from its attach points (N, n, 3): least-squares fit of v - v_mean = w_z x r in xy
-    r = pos - pos.mean(dim=1, keepdim=True)
-    dv = vel - vel.mean(dim=1, keepdim=True)
-    num = (r[..., 0] * dv[..., 1] - r[..., 1] * dv[..., 0]).sum(dim=1)
-    den = torch.clamp((r[..., 0]**2 + r[..., 1]**2).sum(dim=1), min=EPS)
-    return num / den
-
-def tether_torques(drone_attach_pos, drone_attach_vel, payload_attach_pos, payload_attach_vel, torsional_damping):
-    # Suspension yaw friction (rope internal friction, attachments): the tether model only damps along each line, so the
-    # twist mode is otherwise undamped. Opposes the payload-drone relative yaw rate, zero when both turn together.
-    # Torque per attach link [drone..., payload...], split evenly over the n links of each body
-    n = drone_attach_pos.shape[1]
-    rel_yaw_rate = points_yaw_rate(payload_attach_pos, payload_attach_vel) - points_yaw_rate(drone_attach_pos, drone_attach_vel)
-    tau = -torsional_damping * rel_yaw_rate / n # on payload, about world z
-    zeros = torch.zeros_like(tau)
-    tau_payload = torch.stack([zeros, zeros, tau], dim=-1).unsqueeze(1).expand(-1, n, -1)
-    return torch.cat([-tau_payload, tau_payload], dim=1)
-
-class PayloadControlEnv:
+class PayloadControlEnv(RewardsMixin):
+    # Drone carrying a tethered payload; the policy commands [thrust, roll, pitch, yaw rate] to move the payload to a target.
+    # Components: FlightController (action -> RPM), TetherModel (suspension wrench), DomainRandomizer (per-episode params
+    # and initial state), RewardsMixin (reward terms). Only this class talks to the Genesis scene/solver
     def __init__(self, env_cfg: EnvConfig, show_viewer: bool=False, device: str="cuda"):
         self.show_viewer = show_viewer
         self.device = torch.device(device)
@@ -75,7 +34,76 @@ class PayloadControlEnv:
         self.cmd_cfg = self.cfg.cmd_cfg
         self.rew_cfg = self.cfg.rew_cfg
 
-        # ======================== SCENE SETUP ========================
+        self._build_scene()
+        self._init_solver_indices()
+
+        # Components. Nominal masses are identical across envs at build time; get_mass() returns a tensor (scalar or per-env)
+        self.gravity = abs(self.scene.sim.options.gravity[2])
+        drone_mass0 = self.drone.get_mass().flatten()[0].item()
+        payload_mass0 = self.payload.get_mass().flatten()[0].item()
+        self.drone_init_pos = torch.tensor(self.sys_cfg.drone_reset_pos, device=self.device, dtype=gs.tc_float)
+        self.drone_init_quat = torch.tensor(self.sys_cfg.drone_reset_quat, device=self.device, dtype=gs.tc_float)
+        self.payload_init_pos = torch.tensor(self.sys_cfg.payload_reset_pos, device=self.device, dtype=gs.tc_float)
+        self.payload_init_quat = torch.tensor(self.sys_cfg.payload_reset_quat, device=self.device, dtype=gs.tc_float)
+
+        self.ctrl = FlightController(
+            self.cfg, 
+            self.drone, 
+            total_mass=drone_mass0 + payload_mass0, 
+            gravity=self.gravity, 
+            device=self.device
+        )
+        self.tether = TetherModel(
+            self.cfg, 
+            device=self.device
+        )
+        self.dr = DomainRandomizer(
+            self.cfg, 
+            self.tether, 
+            self.ctrl, 
+            drone_mass0, 
+            payload_mass0, 
+            gravity=self.gravity, 
+            device=self.device
+        )
+
+        # The env's torch code is hundreds of tiny ops, bound by Python dispatch and kernel launches regardless of num_envs.
+        # torch.compile fuses each stage into a few kernels (first steps are slow while it compiles). Wrap stages here only:
+        # helpers they call (components, math_utils) are inlined into the stage, so a separately compiled helper only adds dispatch
+        maybe_compile = torch.compile if self.cfg.torch_compile else (lambda fn: fn)
+        self._setpoints_fn = maybe_compile(self.ctrl.setpoints)
+        self._rpms_fn = maybe_compile(self.ctrl.rpms)
+        self._tether_wrench_fn = maybe_compile(self.tether.wrench)
+        self._buffers_fn = maybe_compile(self._compute_buffers)
+        self._post_step_fn = maybe_compile(self._post_step)
+        self._observations_fn = maybe_compile(self._compute_observations)
+
+        self._init_buffers()
+        self._init_rewards()
+
+        self.target_marker = TargetMarker(self.scene) if self.show_viewer else None
+        if self.show_viewer:
+            attach_viewer_logs(self)
+
+        if self.cfg.torch_compile:
+            self._warm_up_compile()
+        self.reset()
+
+    # ======================== SETUP ========================
+
+    def _warm_up_compile(self):
+        # Compile every stage now rather than inside the first training iteration: the first call of each compiled stage
+        # traces and compiles it (seconds), so one throwaway hover step pays for all of them. The reset after it (in
+        # __init__) restarts every episode; the success counters are cleared here since reset() leaves them alone
+        self.reset()
+        self.step(torch.zeros((self.num_envs, self.num_actions), device=self.device, dtype=gs.tc_float))
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device) # compile + first launches done before construction returns
+        self.success_count.zero_()
+        self.episode_count.zero_()
+        self.success_steps = 0
+
+    def _build_scene(self):
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(dt=self.sim_dt, substeps=self.cfg.sim_substeps),
             viewer_options=gs.options.ViewerOptions(
@@ -85,7 +113,7 @@ class PayloadControlEnv:
                 refresh_rate=30,
             ),
             vis_options=gs.options.VisOptions(
-                rendered_envs_idx=list(range(1)), 
+                rendered_envs_idx=list(range(1)),
                 background_color=(0.2, 0.2, 0.2),
                 shadow=False,
             ),
@@ -107,8 +135,6 @@ class PayloadControlEnv:
             ),
         )
 
-        self.target_debug_objs = [] # viewer-only target (sphere + yaw_ref arrow) for env 0, see _draw_target
-
         drone_attach_links = [f"attach{x}_link" for x in range(self.sys_cfg.num_tethers)]
         self.drone = self.scene.add_entity(
             gs.morphs.Drone(
@@ -122,7 +148,6 @@ class PayloadControlEnv:
             ),
         )
         self.drone_attach_links = [self.drone.get_link(x) for x in drone_attach_links]
-        self.drone_attach_links_idx = [link.idx_local for link in self.drone_attach_links]
 
         payload_attach_links = [f"attach_{x}" for x in range(self.sys_cfg.num_tethers)]
         self.payload = self.scene.add_entity(
@@ -135,203 +160,76 @@ class PayloadControlEnv:
             ),
         )
         self.payload_attach_links = [self.payload.get_link(x) for x in payload_attach_links]
-        self.payload_attach_links_idx = [link.idx_local for link in self.payload_attach_links]
 
         self.scene.build(n_envs=self.num_envs)
-        if self.show_viewer:
-            self._attach_viewer_logs()
-        # ======================== END OF SCENE SETUP ========================
 
-        # Rate Controller
-        self.gravity = abs(self.scene.sim.options.gravity[2])
-        max_motor_thrust = self.sys_cfg.twr_max * (self.drone.get_mass() + self.payload.get_mass()).flatten()[0].item() * self.gravity / self.drone.n_propellers
-        rotors = rotors_from_genesis(
-            self.drone,
-            self.sys_cfg.propellers_link_name,
-            self.sys_cfg.propellers_spin,
-            ct=self.sys_cfg.rotor_ct,
-        )
-        self.rate_ctrl = QCRateController(
-            num_envs=self.num_envs,
-            dt=self.sim_dt,
-            rotors=rotors,
-            rpm_max=math.sqrt(max_motor_thrust / self.drone.KF),
-            device=self.device,
-            params=self.sys_cfg.rate_control_params,
-            plant=self.sys_cfg.motor_plant_params,
-            dtype=gs.tc_float
-        )
-        self.att_ctrl = QCAttitudeController(
-            num_envs=self.num_envs,
-            dt=self.sim_dt,
-            device=self.device,
-            params=self.sys_cfg.attitude_control_params,
-            dtype=gs.tc_float,
-        )
-        self.hover_thrust = self.rate_ctrl.thrust_setpoint_for_thrust_fraction(1.0 / self.sys_cfg.twr_max)
-
-        # Per-sim-step torch code is hundreds of tiny ops, bound by Python dispatch and kernel launches regardless of num_envs.
-        # torch.compile fuses them into a few kernels (first steps are slow while it compiles)
-        maybe_compile = torch.compile if self.cfg.torch_compile else (lambda fn: fn)
-        self._att_ctrl_update = maybe_compile(self.att_ctrl.update)
-        self._rate_ctrl_update = maybe_compile(self.rate_ctrl.update)
-        self._tether_forces = maybe_compile(tether_forces)
-        self._tether_torques = maybe_compile(tether_torques)
-
-        # Tether links of both entities in one solver call (each Genesis call carries a fixed Python validation cost)
+    def _init_solver_indices(self):
+        # Links/dofs of both entities in one solver call each (every Genesis call carries a fixed Python validation cost)
         self.rigid_solver = self.scene.sim.rigid_solver
-        self.tether_links_idx = torch.tensor([link.idx for link in self.drone_attach_links + self.payload_attach_links], device=self.device, dtype=gs.tc_int)
-        self.num_tethers = len(self.drone_attach_links)
-        self.torsional_damping = torch.full((self.num_envs, ), self.sys_cfg.torsional_damping, device=self.device, dtype=gs.tc_float) # randomized per episode
-        self.min_cos_tilt = math.cos(self.sys_cfg.tilt_comp_max)
+        self.tether_links_idx = torch.tensor([link.idx for link in self.drone_attach_links + self.payload_attach_links], device=self.device, dtype=gs.tc_int) # [drone..., payload...]
+        self.base_links_idx = torch.tensor([self.drone.base_link_idx, self.payload.base_link_idx], device=self.device, dtype=gs.tc_int) # [drone, payload]
+        # Free joints only, see reset_idx: qpos [pos, quat] equals the base link pose (base links have no inertial offset)
+        assert self.drone.n_qs == 7 and self.payload.n_qs == 7 and self.drone.n_dofs == 6 and self.payload.n_dofs == 6
+        self.base_qs_idx = list(range(self.drone.q_start, self.drone.q_end)) + list(range(self.payload.q_start, self.payload.q_end))
+        self.base_dofs_idx = list(range(self.drone.dof_start, self.drone.dof_end)) + list(range(self.payload.dof_start, self.payload.dof_end))
+        # Mass-carrying links of [drone..., payload...], see _apply_masses (same selection as entity.set_mass)
+        drone_mass_links = [link.idx for link in self.drone.links if not link.is_fixed]
+        self.mass_links_idx = drone_mass_links + [link.idx for link in self.payload.links if not link.is_fixed]
+        self.num_drone_mass_links = len(drone_mass_links)
 
-        # Initialized state
-        dr = self.cfg.dr_cfg
-        self.win_steps = int(dr.success_window_s / self.dt)
-        self.win_err = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_float)
+    def _init_buffers(self):
+        zeros = lambda *shape, dtype=gs.tc_float: torch.zeros((self.num_envs, *shape), device=self.device, dtype=dtype)
 
-        self.dr_level = 1.0 # scales every enabled group's range (evals set 0 for nominal), see _dr_scale
+        self.world_up = torch.tensor([0.0, 0.0, 1.0], device=self.device, dtype=gs.tc_float).expand(self.num_envs, -1) # body z-axis for thrust axis
+        self.world_down = -self.world_up # gravity direction for projected gravity
+        s = self.cfg.obs_scales
+        self.pos_obs_scale = torch.tensor([s.px, s.py, s.pz], device=self.device, dtype=gs.tc_float)
+        self.vel_obs_scale = torch.tensor([s.vx, s.vy, s.vz], device=self.device, dtype=gs.tc_float)
+
+        # Environment state buffers
+        self.obs_buf = zeros(self.cfg.num_obs)
+        self.critic_obs_buf = zeros(self.cfg.num_obs + 8) # obs + DomainRandomizer.privileged_obs
+        self.reset_buf = zeros(dtype=gs.tc_int)
+        self.episode_length_buf = zeros(dtype=gs.tc_int)
+        self.commands = zeros(self.cmd_cfg.num_commands)
+        self.actions = zeros(self.num_actions)
+        self.prev_actions = zeros(self.num_actions)
+        self.actions_raw = zeros(self.num_actions)
+        self.crash_condition = zeros(dtype=gs.tc_bool)
+
+        # Observation state buffers
+        self.payload_pos_err = zeros(3) # Drone heading frame (RTK)
+        self.payload_yaw_err = zeros() # wrap(yaw_ref - payload yaw)
+        self.payload_vel = zeros(3) # Drone heading frame (RTK)
+        self.payload_proj_g = zeros(3) # Gravity in payload body axes
+        self.payload_body_rates = zeros(3) # Body frame (IMU gyro)
+        self.payload_swing_angles = zeros(2) # Drone-Payload relative position vector
+        self.payload_swing_angles_rates = zeros(2) # --
+        self.drone_proj_g = zeros(3) # Gravity in drone body axes
+        self.drone_body_rates = zeros(3) # Drone body frame (IMU)
+        self.drone_payload_rel_yaw = zeros() # For tether tangling termination (PL RKT+MAG)
+
+        # Non-observations
+        self.payload_pos = zeros(3) # world, for ground crash
+        self.drone_yaw = zeros() # abs drone yaw
+        self.swing_amp = zeros() # equivalent pendulum amplitude [rad]
+
+        # Success rate, see _post_step and _log_success_rate
+        self.win_steps = int(self.cfg.dr_cfg.success_window_s / self.dt)
+        self.win_err = zeros()
         self.success_count = torch.zeros((), device=self.device)
         self.episode_count = torch.zeros((), device=self.device)
         self.success_steps = 0 # policy steps into the current success window
 
-        self.payload_mass0 = self.payload.get_mass().flatten()[0].item() # get_mass() returns a tensor (scalar or per-env); nominal masses are identical across envs at build time
-        self.drone_mass0 = self.drone.get_mass().flatten()[0].item()
-        self.rest_length = torch.full((self.num_envs, ), self.sys_cfg.rest_length, device=self.device, dtype=gs.tc_float)
-        self.stiffness = torch.full((self.num_envs, ), self.sys_cfg.stiffness, device=self.device, dtype=gs.tc_float)
-        self.damping = torch.full((self.num_envs, ), self.sys_cfg.damping, device=self.device, dtype=gs.tc_float)
-        self.payload_mass = torch.full((self.num_envs, ), self.payload_mass0, device=self.device, dtype=gs.tc_float)
-        self.drone_mass = torch.full((self.num_envs, ), self.drone_mass0, device=self.device, dtype=gs.tc_float)
-        self.mass_eff = 1.0 / (1.0 / self.drone_mass + 1.0 / self.payload_mass)
-        self.g_eff = (1.0 + self.payload_mass / self.drone_mass) * self.gravity
-        self.rpm_scale = torch.ones((self.num_envs, ), device=self.device, dtype=gs.tc_float)
-        self.latency_steps = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_int)
-        # Latency range in sim steps. Config snapshots from before latency_s give it in sim steps directly
-        dr_cfg = self.cfg.dr_cfg
-        if hasattr(dr_cfg, "latency_s"):
-            self.latency_range_steps = tuple(round(s / self.sim_dt) for s in dr_cfg.latency_s)
-        else:
-            self.latency_range_steps = tuple(dr_cfg.latency_sim_steps)
-        self.latency_max_steps = max(self.latency_range_steps[1], 1) # privileged obs normalization: max latency -> 1
-        self.prev_sp = torch.zeros((self.num_envs, 4), device=self.device, dtype=gs.tc_float)
+        self.extras = dict() # logging information
 
-        self.drone_init_pos = torch.tensor(self.sys_cfg.drone_reset_pos, device=self.device, dtype=gs.tc_float)
-        self.drone_init_quat = torch.tensor(self.sys_cfg.drone_reset_quat, device=self.device, dtype=gs.tc_float)
-        self.payload_init_pos = torch.tensor(self.sys_cfg.payload_reset_pos, device=self.device, dtype=gs.tc_float)
-        self.payload_init_quat = torch.tensor(self.sys_cfg.payload_reset_quat, device=self.device, dtype=gs.tc_float)
-        self.world_up = torch.tensor([0.0, 0.0, 1.0], device=self.device, dtype=gs.tc_float).expand(self.num_envs, -1) # body z-axis for thrust axis
-        self.world_down = -self.world_up # gravity direction for projected gravity
-
-        s = self.cfg.obs_scales
-        self.pos_obs_scale = torch.tensor([s.px, s.py, s.pz], device=self.device, dtype=gs.tc_float)
-        self.vel_obs_scale = torch.tensor([s.vx, s.vy, s.vz], device=self.device, dtype=gs.tc_float)
-        self.w_smooth_actions = torch.tensor(self.rew_cfg.w_smooth_actions, device=self.device, dtype=gs.tc_float)
-
-        # Environment state buffers
-        self.obs_buf = torch.zeros((self.num_envs, self.cfg.num_obs), device=self.device, dtype=gs.tc_float)
-        self.rew_buf = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_float)
-        self.reset_buf = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_int)
-        self.episode_length_buf = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_int)
-        self.commands = torch.zeros((self.num_envs, self.cmd_cfg.num_commands), device=self.device, dtype=gs.tc_float)
-        self.actions = torch.zeros((self.num_envs, self.cfg.num_actions), device=self.device, dtype=gs.tc_float)
-        self.prev_actions = torch.zeros((self.num_envs, self.cfg.num_actions), device=self.device, dtype=gs.tc_float)
-        self.actions_raw = torch.zeros((self.num_envs, self.cfg.num_actions), device=self.device, dtype=gs.tc_float)
-        self.crash_condition = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_bool)
-
-        # Observation state buffers
-        self.payload_pos_err = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float) # Drone heading frame (RTK)
-        self.payload_yaw_err = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_float) # wrap(yaw_ref - payload yaw)
-        self.payload_vel = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float) # Drone heading frame (RTK)
-        self.payload_proj_g = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float) # Gravity in payload body axes
-        self.payload_body_rates = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float) # Body frame (IMU gyro)
-        self.payload_swing_angles = torch.zeros((self.num_envs, 2), device=self.device, dtype=gs.tc_float) # Drone-Payload relative position vector
-        self.payload_swing_angles_rates = torch.zeros((self.num_envs, 2), device=self.device, dtype=gs.tc_float) # --
-        self.drone_proj_g = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float) # Gravity in drone body axes
-        self.drone_body_rates = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float) # Drone body frame (IMU)
-        self.drone_payload_rel_yaw = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_float) # For tether tangling termination (PL RKT+MAG)
-
-        # Non-observations
-        self.drone_yaw = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_float) # abs drone yaw
-        self.swing_amp = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_float) # equivalent pendulum amplitude [rad]
-
-        self.extras= dict() # logging information
-
-        # Reward terms (each returns its weighted per-env reward) and per-episode sums for logging
-        self.reward_fns = {
-            "track": self._reward_track,
-            "vmax": self._reward_vmax,
-            "damping": self._reward_damping,
-            "swing_energy": self._reward_swing_energy,
-            "tilt": self._reward_tilt,
-            "yaw_error": self._reward_yaw,
-            "yaw_damping": self._reward_yaw_damping,
-            "smooth_actions": self._reward_smooth_actions,
-            "action_bound": self._reward_action_bound,
-            "crash": self._reward_crash,
-        }
-        self.episode_sums = {name: torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_float) for name in self.reward_fns}
-
-        self.reset()
+    # ======================== RL INTERFACE ========================
 
     def get_observations(self):
-        priv = torch.stack([
-            self.rest_length / self.sys_cfg.rest_length - 1.0,
-            torch.log(self.stiffness / self.sys_cfg.stiffness),
-            torch.log(self.damping / self.sys_cfg.damping),
-            torch.log(self.torsional_damping / self.sys_cfg.torsional_damping),
-            self.payload_mass / self.payload_mass0 - 1.0,
-            self.drone_mass / self.drone_mass0 - 1.0,
-            self.rpm_scale**2 - 1.0,
-            self.latency_steps.float() / self.latency_max_steps,
-        ], dim=-1)
-
         return TensorDict({
             "policy": self.obs_buf, # noisy
-            "critic": torch.cat([self.obs_buf, priv], dim=-1), # clean + priv obs
+            "critic": self.critic_obs_buf, # clean + priv obs
         }, batch_size=[self.num_envs])
-
-    def reset_idx(self, envs_idx):
-        self.extras["episode"] = {} # cleared every step so rsl_rl never re-logs stale values
-        if len(envs_idx) == 0:
-            return
-
-        for name, ep_sum in self.episode_sums.items():
-            self.extras["episode"][f"Episode_Reward/{name}"] = torch.mean(ep_sum[envs_idx]) / self.cfg.episode_length_s
-            ep_sum[envs_idx] = 0.0
-
-        # Sample random tether parameters
-        self._randomize_system_params(envs_idx)
-
-        # Sample initial state
-        drone_pos, drone_quat, drone_vel, payload_pos, payload_quat, payload_vel = self._sample_initial_state(envs_idx)
-        
-        # Reset drone
-        self.drone.set_pos(drone_pos, zero_velocity=True, envs_idx=envs_idx)
-        self.drone.set_quat(drone_quat, zero_velocity=True, envs_idx=envs_idx)
-        self.drone.set_dofs_velocity(drone_vel, dofs_idx_local=[0,1,2], envs_idx=envs_idx)
-        
-        # Reset payload
-        self.payload.set_pos(payload_pos, zero_velocity=True, envs_idx=envs_idx)
-        self.payload.set_quat(payload_quat, zero_velocity=True, envs_idx=envs_idx)
-        self.payload.set_dofs_velocity(payload_vel, dofs_idx_local=[0,1,2], envs_idx=envs_idx)
-
-        # Reset controller
-        self.rate_ctrl.reset(envs_idx, thrust_sp=self.hover_thrust) # hover after reset
-        self.att_ctrl.reset(envs_idx, quat=drone_quat) # yaw setpoint = current heading
-
-        # Commands (yaw_ref sampled relative to the reset payload heading)
-        payload_yaw0 = quat_yaw(payload_quat)
-        self._resample_commands(envs_idx, payload_yaw0)
-
-        # Previous controller setpoint (action policy latency)
-        self.prev_sp[envs_idx] = torch.tensor([self.hover_thrust, 0.0, 0.0, 0.0], device=self.device, dtype=gs.tc_float)
-        self.win_err[envs_idx] = 0.0
-
-        self.actions[envs_idx] = 0
-        self.prev_actions[envs_idx] = 0
-        self.episode_length_buf[envs_idx] = 0
-        self.crash_condition[envs_idx] = 0
-
 
     def reset(self):
         self.reset_buf[:] = True
@@ -342,31 +240,17 @@ class PayloadControlEnv:
 
     def step(self, actions):
         self.actions_raw = actions # pre-clip policy sample, for the action bound penalty
-        self.actions = torch.clip(actions, -self.cfg.clip_actions, self.cfg.clip_actions) # [-1; 1]
-
-        # thrust_sp, roll_sp, pitch_sp, yawrate_sp = self._scale_actions(self.actions)
-        sp = torch.stack(self._scale_actions(self.actions), dim=-1) # (N, 4)
+        self.actions, substep_sps = self._setpoints_fn(actions)
 
         # Setpoints held constant (zero-order hold) while the inner loop runs at sim rate
-        # Viewer refreshed on the last substep only (policy rate), see _attach_viewer_logs for the matching pacing
+        # Viewer refreshed on the last substep only (policy rate), see viewer.attach_viewer_logs for the matching pacing
         for i in range(self.decimation):
-            late = (i < self.latency_steps).unsqueeze(-1)
-            thrust_sp, roll_sp, pitch_sp, yawrate_sp = torch.where(late, self.prev_sp, sp).unbind(-1)
-            self._sim_step(thrust_sp, roll_sp, pitch_sp, yawrate_sp, update_visualizer=(i == self.decimation - 1))
-        self.prev_sp = sp
+            self._sim_step(substep_sps[i], update_visualizer=(i == self.decimation - 1))
 
         self.episode_length_buf += 1
 
         self._update_buffers()
-        self._update_crash_conditions()
-        self._compute_reward()
-
-        # Success: episode survived to timeout with the payload near the target (terminal state, before reset)
-        in_win = (self.episode_length_buf > self.max_episode_length - self.win_steps).float()
-        self.win_err += in_win * torch.norm(self.payload_pos_err, dim=1)
-        success = self.reset_buf & ~self.crash_condition & (self.win_err / self.win_steps < self.cfg.dr_cfg.success_pos_err)
-        self.success_count += success.sum()
-        self.episode_count += self.reset_buf.sum()
+        self.extras["time_outs"] = self._post_step_fn()
 
         self.reset_idx(self.reset_buf.nonzero(as_tuple=False).reshape((-1, )))
         self._update_buffers() # update again to catch initial states (cheap but could be guarded)
@@ -377,84 +261,95 @@ class PayloadControlEnv:
 
         return self.get_observations(), self.rew_buf, self.reset_buf, self.extras
 
-    def _scale_actions(self, actions):
-            # Thrust: piecewise linear so a=0 is hover, a=-1 is zero thrust, a=+1 is max thrust
-            a_thrust = actions[:, 0]
-            thrust_sp = torch.where(
-                a_thrust >= 0.0,
-                self.hover_thrust + a_thrust * (self.sys_cfg.max_throttle - self.hover_thrust),
-                self.hover_thrust * (1.0 + a_thrust),
-            )
+    def reset_idx(self, envs_idx):
+        self.extras["episode"] = {} # cleared every step so rsl_rl never re-logs stale values
+        if len(envs_idx) == 0:
+            return
 
-            # a[1:3] roll/pitch setpoints, a[3] yaw-rate setpoint
-            roll_sp = actions[:,1] * self.sys_cfg.max_tilt
-            pitch_sp = actions[:,2] * self.sys_cfg.max_tilt
-            yawrate_sp = actions[:,3] * self.sys_cfg.max_yaw_rate
+        self._log_episode_rewards(envs_idx)
 
-            if self.sys_cfg.thrust_tilt_comp:
-                cos_tilt = torch.clamp(torch.cos(roll_sp) * torch.cos(pitch_sp), min=self.min_cos_tilt)
-                thrust_sp = torch.clamp(thrust_sp / cos_tilt, max=self.sys_cfg.max_throttle)
-            
-            return thrust_sp, roll_sp, pitch_sp, yawrate_sp
-    
-    def _sim_step(self, thrust_sp, roll_sp, pitch_sp, yawrate_sp, update_visualizer=True):
-        # Read drone body rate state
-        drone_quat = self.drone.get_quat()
-        drone_body_rates = transform_by_quat(self.drone.get_ang(), inv_quat(drone_quat))
+        # New system parameters and initial state
+        self.dr.randomize(envs_idx)
+        self._apply_masses(envs_idx)
+        drone_pos, drone_quat, drone_vel, payload_pos, payload_quat, payload_vel = self.dr.sample_initial_state(envs_idx)
 
-        # Get motor RPM from ratecontroller/mixer
-        rate_sp = self._att_ctrl_update(drone_quat, roll_sp, pitch_sp, yawrate_sp)
-        rpms = self._rate_ctrl_update(thrust_sp, rate_sp, drone_body_rates)
-        self.drone.set_propellers_rpm(rpms * self.rpm_scale[:, None])
+        # Reset drone and payload together through their free joints. Forward kinematics runs once, in the qpos write
+        zeros = torch.zeros_like(drone_vel)
+        self.rigid_solver.set_dofs_velocity(torch.cat([drone_vel, zeros, payload_vel, zeros], dim=1), self.base_dofs_idx, envs_idx, skip_forward=True) # [lin, ang] per entity
+        qpos = torch.cat([drone_pos, drone_quat, payload_pos, payload_quat], dim=1)
+        self.rigid_solver.set_qpos(qpos, self.base_qs_idx, envs_idx)
 
-        # Step tether model
-        self._tethers_step()
+        self.ctrl.reset(envs_idx, drone_quat)
 
-        # Step sim scene
-        self.scene.step(update_visualizer=update_visualizer)
+        # Commands (yaw_ref sampled relative to the reset payload heading)
+        self._resample_commands(envs_idx, quat_yaw(payload_quat))
 
-    def _tethers_step(self):
-        # Step tether tension-force model. Links ordered [drone attach..., payload attach...], see tether_links_idx
-        n = self.num_tethers
+        self.win_err[envs_idx] = 0.0
+        self.actions[envs_idx] = 0
+        self.prev_actions[envs_idx] = 0
+        self.episode_length_buf[envs_idx] = 0
+        self.crash_condition[envs_idx] = 0
+
+    # ======================== SIMULATION ========================
+
+    def _sim_step(self, sp, update_visualizer=True):
+        # Motor RPM from attitude/rate controller and mixer
+        self.drone.set_propellers_rpm(self._rpms_fn(self.drone.get_quat(), self.drone.get_ang(), sp))
+
+        # Tether wrench on the attach links [drone..., payload...], see tether_links_idx
         pos = self.rigid_solver.get_links_pos(self.tether_links_idx, relative=True)
         vel = self.rigid_solver.get_links_vel(self.tether_links_idx, relative=True)
-        force_on_drone = self._tether_forces(
-            pos[:, :n], vel[:, :n], pos[:, n:], vel[:, n:],
-            self.rest_length[:, None], self.sys_cfg.activation_delta, self.stiffness[:, None], self.damping[:, None],
-            self.mass_eff[:, None], self.sim_dt,
-        )
-        torque = self._tether_torques(pos[:, :n], vel[:, :n], pos[:, n:], vel[:, n:], self.torsional_damping)
-        self.rigid_solver.apply_links_external_wrench(
-            force=torch.cat([force_on_drone, -force_on_drone], dim=1),
-            torque=torque,
-            links_idx=self.tether_links_idx,
-        )
+        force, torque = self._tether_wrench_fn(pos, vel)
+        self.rigid_solver.apply_links_external_wrench(force=force, torque=torque, links_idx=self.tether_links_idx)
+
+        self.scene.step(update_visualizer=update_visualizer)
+
+    def _apply_masses(self, envs_idx):
+        # entity.set_mass for both entities in one solver write: scale each entity's link masses (and inertia) to its total
+        links_mass = self.rigid_solver.get_links_mass(self.mass_links_idx, envs_idx)
+        k = self.num_drone_mass_links
+        drone_links_mass, payload_links_mass = links_mass[:, :k], links_mass[:, k:]
+        links_mass = torch.cat([
+            drone_links_mass * self.dr.drone_mass[envs_idx, None] / drone_links_mass.sum(dim=-1, keepdim=True),
+            payload_links_mass * self.dr.payload_mass[envs_idx, None] / payload_links_mass.sum(dim=-1, keepdim=True),
+        ], dim=1)
+        self.rigid_solver.set_links_mass(links_mass, self.mass_links_idx, envs_idx, scale_inertia=True)
+
+    # ======================== STATE ========================
 
     def _update_buffers(self):
+        # Base link states of [drone, payload], see base_links_idx
+        pos = self.rigid_solver.get_links_pos(self.base_links_idx, relative=True)
+        quat = self.rigid_solver.get_links_quat(self.base_links_idx, relative=True)
+        vel = self.rigid_solver.get_links_vel(self.base_links_idx, relative=True)
+        ang = self.rigid_solver.get_links_ang(self.base_links_idx)
+        self._buffers_fn(pos, quat, vel, ang)
+
+    def _compute_buffers(self, pos, quat, vel, ang):
+        drone_pos, payload_pos = pos.unbind(1)
+        drone_quat, payload_quat = quat.unbind(1)
+        drone_vel, payload_vel = vel.unbind(1)
+        drone_ang, payload_ang = ang.unbind(1)
+
         # Drone attitude (heading frame defined by drone yaw)
-        drone_quat = self.drone.get_quat()
-        drone_inv_quat = inv_quat(drone_quat)
         self.drone_yaw[:] = quat_yaw(drone_quat)
         yaw = self.drone_yaw
-        self.drone_proj_g[:] = transform_by_quat(self.world_down, drone_inv_quat)
-        self.drone_body_rates[:] = transform_by_quat(self.drone.get_ang(), drone_inv_quat)
+        self.drone_proj_g[:] = rotate_by_quat(self.world_down, drone_quat, inverse=True)
+        self.drone_body_rates[:] = rotate_by_quat(drone_ang, drone_quat, inverse=True)
 
         # Payload tracking and attitude
-        payload_pos = self.payload.get_pos()
-        payload_vel = self.payload.get_vel()
-        payload_quat = self.payload.get_quat()
-        payload_inv_quat = inv_quat(payload_quat)
         payload_yaw = quat_yaw(payload_quat)
+        self.payload_pos[:] = payload_pos
         self.payload_pos_err[:] = rotate_to_heading(self.commands[:, :3] - payload_pos, yaw)
         self.payload_yaw_err[:] = wrap_angle(self.commands[:, 3] - payload_yaw) # can wrap: observed as sin/cos
         self.payload_vel[:] = rotate_to_heading(payload_vel, yaw)
-        self.payload_proj_g[:] = transform_by_quat(self.world_down, payload_inv_quat)
-        self.payload_body_rates[:] = transform_by_quat(self.payload.get_ang(), payload_inv_quat)
+        self.payload_proj_g[:] = rotate_by_quat(self.world_down, payload_quat, inverse=True)
+        self.payload_body_rates[:] = rotate_by_quat(payload_ang, payload_quat, inverse=True)
 
         self.drone_payload_rel_yaw[:] = wrap_angle(payload_yaw - yaw) # will terminate before wrap-issue
 
-        r_w = payload_pos - self.drone.get_pos() # drone->payload vector
-        r_dot_w = payload_vel - self.drone.get_vel() # drone->payload vector rate
+        r_w = payload_pos - drone_pos # drone->payload vector
+        r_dot_w = payload_vel - drone_vel # drone->payload vector rate
         r = rotate_to_heading(r_w, yaw) # drone->payload vector in yaw-frame (abs yaw from drone FC)
         r_dot = rotate_to_heading(r_dot_w, yaw) # -- rates
 
@@ -473,10 +368,25 @@ class PayloadControlEnv:
         L = torch.clamp(torch.norm(r_w, dim=1, keepdim=True), min=EPS)
         q = -r_w / L # payload -> drone
         r_dot_perp = r_dot_w - torch.sum(r_dot_w * q, dim=1, keepdim=True) * q # drop cable stretch
-        thrust_axis = transform_by_quat(self.world_up, drone_quat)
-        e_kin = 0.5 * torch.sum(torch.square(r_dot_perp), dim=1) / (L.squeeze(1) * self.g_eff)
+        thrust_axis = rotate_by_quat(self.world_up, drone_quat)
+        e_kin = 0.5 * torch.sum(torch.square(r_dot_perp), dim=1) / (L.squeeze(1) * self.dr.g_eff)
         e_pot = 1.0 - torch.sum(q * thrust_axis, dim=1)
         self.swing_amp[:] = torch.acos(torch.clamp(1.0 - (e_kin + e_pot), min=-1.0, max=1.0))
+
+    # ======================== TERMINATION / SUCCESS ========================
+
+    def _post_step(self):
+        # Terminations, rewards and success accounting on the terminal state (before reset). Returns the timeouts
+        timeout = self._update_crash_conditions()
+        self._compute_reward()
+
+        # Success: episode survived to timeout with the payload near the target
+        in_win = (self.episode_length_buf > self.max_episode_length - self.win_steps).float()
+        self.win_err += in_win * torch.norm(self.payload_pos_err, dim=1)
+        success = self.reset_buf & ~self.crash_condition & (self.win_err / self.win_steps < self.cfg.dr_cfg.success_pos_err)
+        self.success_count += success.sum()
+        self.episode_count += self.reset_buf.sum()
+        return timeout
 
     def _update_crash_conditions(self):
         payload_up_z = -self.payload_proj_g[:, 2] # cos(payload tilt)
@@ -491,16 +401,31 @@ class PayloadControlEnv:
             | (torch.abs(self.drone_payload_rel_yaw[:]) > self.cfg.terminate_if_relyaw_greater_than)
             | (payload_up_z < math.cos(self.cfg.terminate_if_payload_tilt_greater_than))
             | (drone_up_z < math.cos(self.cfg.terminate_if_drone_tilt_greater_than))
-            | (self.payload.get_pos()[:, 2] <= self.cfg.terminate_if_payload_below_z)
+            | (self.payload_pos[:, 2] <= self.cfg.terminate_if_payload_below_z)
         )
         timeout = self.episode_length_buf > self.max_episode_length
         self.reset_buf = timeout | self.crash_condition
-        self.extras["time_outs"] = timeout
+        return timeout
+
+    def _log_success_rate(self):
+        # Fraction of episodes ending in success over each window of success_interval policy steps
+        self.success_steps += 1
+        if self.success_steps < self.cfg.dr_cfg.success_interval or self.episode_count.item() == 0:
+            return
+        self.extras["episode"]["Task/success_rate"] = (self.success_count / self.episode_count).item()
+        self.success_count.zero_()
+        self.episode_count.zero_()
+        self.success_steps = 0
+
+    # ======================== OBSERVATIONS / COMMANDS ========================
 
     def _update_observations(self):
+        self.obs_buf, self.critic_obs_buf = self._observations_fn()
+
+    def _compute_observations(self):
         # Yaw-agnostic: heading-frame, body-frame or relative quantities only
         s = self.cfg.obs_scales
-        self.obs_buf = torch.cat(
+        obs = torch.cat(
             [
                 # Task (heading frame)
                 torch.clamp(self.payload_pos_err * self.pos_obs_scale, -1.0, 1.0), # payload pos err, dim=3
@@ -520,24 +445,7 @@ class PayloadControlEnv:
             ],
             axis=1
         )
-
-    def _log_success_rate(self):
-        # Fraction of episodes ending in success over each window of success_interval policy steps
-        self.success_steps += 1
-        if self.success_steps < self.cfg.dr_cfg.success_interval or self.episode_count.item() == 0:
-            return
-        self.extras["episode"]["Task/success_rate"] = (self.success_count / self.episode_count).item()
-        self.success_count.zero_()
-        self.episode_count.zero_()
-        self.success_steps = 0
-
-    def _dr_scale(self, group):
-        # Range scale of a randomization group: dr_level if enabled, else nominal (0).
-        # "yaw" is the task's yaw_ref range rather than a randomization, so it is full (1) when not in groups
-        dr = self.cfg.dr_cfg
-        if dr.enabled and group in dr.groups:
-            return self.dr_level
-        return 1.0 if group == "yaw" else 0.0
+        return obs, torch.cat([obs, self.dr.privileged_obs()], dim=-1)
 
     def _resample_commands(self, envs_idx, payload_yaw0, n=1):
         if len(envs_idx) == 0:
@@ -547,173 +455,12 @@ class PayloadControlEnv:
         self.commands[envs_idx, 0] = gs_rand_float(pl_init[0] - self.cmd_cfg.pos_x_range, pl_init[0] + self.cmd_cfg.pos_x_range, shape=(len(envs_idx), ), device=self.device)
         self.commands[envs_idx, 1] = gs_rand_float(pl_init[1] - self.cmd_cfg.pos_y_range, pl_init[1] + self.cmd_cfg.pos_y_range, shape=(len(envs_idx), ), device=self.device)
         self.commands[envs_idx, 2] = gs_rand_float(pl_init[2] - self.cmd_cfg.pos_z_range, pl_init[2] + self.cmd_cfg.pos_z_range, shape=(len(envs_idx), ), device=self.device)
-        yaw_max = self._dr_scale("yaw") * self.cmd_cfg.yaw_range
+        yaw_max = self.cmd_cfg.yaw_range
         self.commands[envs_idx, 3] = wrap_angle(payload_yaw0 + gs_rand_float(-yaw_max, yaw_max, shape=(len(envs_idx), ), device=self.device))
 
         self._draw_target(envs_idx)
 
-    def _randomize_system_params(self, envs_idx):
-        dr, n, L0 = self.cfg.dr_cfg, len(envs_idx), self.sys_cfg.rest_length
-
-        tether_lvl = self._dr_scale("tether")
-        L = L0 * rand_uniform(lerp(dr.rest_length_scale, tether_lvl), n, self.device)
-        self.rest_length[envs_idx] = L
-
-        # Rope axial stiffness is EA/L: a longer rope is softer
-        self.stiffness[envs_idx] = self.sys_cfg.stiffness * (L0 / L) * rand_log_uniform(loglerp(dr.stiffness_scale, tether_lvl), n, self.device)
-        self.damping[envs_idx] = self.sys_cfg.damping * rand_log_uniform(loglerp(dr.damping_scale, tether_lvl), n, self.device)
-        self.torsional_damping[envs_idx] = self.sys_cfg.torsional_damping * rand_log_uniform(loglerp(dr.torsional_damping_scale, tether_lvl), n, self.device)
-
-        # Masses
-        bodies_lvl = self._dr_scale("bodies")
-        pm = self.payload_mass0 * rand_uniform(lerp(dr.payload_mass_scale, bodies_lvl), n, self.device)
-        dm = self.drone_mass0 * rand_uniform(lerp(dr.drone_mass_scale, bodies_lvl), n, self.device)
-        self.payload_mass[envs_idx] = pm
-        self.drone_mass[envs_idx] = dm
-        self.mass_eff[envs_idx] = 1.0 / (1.0 / dm + 1.0 / pm)
-        self.g_eff[envs_idx] = (1.0 + pm / dm) * self.gravity
-        self.payload.set_mass(pm, envs_idx=envs_idx)
-        self.drone.set_mass(dm, envs_idx=envs_idx)
-
-        # Actuation
-        actuation_lvl = self._dr_scale("actuation")
-        self.rpm_scale[envs_idx] = torch.sqrt(rand_uniform(lerp(dr.thrust_scale, actuation_lvl), n, self.device))
-        lo, hi = self.latency_range_steps
-        self.latency_steps[envs_idx] = torch.randint(lo, round(lo + actuation_lvl * (hi - lo)) + 1, (n, ), device=self.device, dtype=gs.tc_int)
-
-    def _sample_initial_state(self, envs_idx):
-        dr, n = self.cfg.dr_cfg, len(envs_idx)
-        
-        init_lvl = self._dr_scale("init")
-        L = self.rest_length[envs_idx]
-
-        # Swing: r = drone->payload, built so atan2(r_x, -r_z) = theta_x
-        th = gs_rand_float(-dr.init_swing_angle * init_lvl, dr.init_swing_angle * init_lvl, (n, 2), self.device)
-        r_hat = torch.stack([torch.tan(th[:, 0]), torch.tan(th[:, 1]), -torch.ones_like(L)], dim=-1)
-        r_hat = r_hat / torch.norm(r_hat, dim=-1, keepdim=True)
-        payload_pos = self.payload_init_pos.expand(n, -1)
-        attach_dz = 0.045
-        drone_pos = payload_pos - r_hat * (L + attach_dz + 0.01).unsqueeze(-1) # slightly taut
-
-        # Heading
-        yaw_d = gs_rand_float(-math.pi, math.pi, (n, ), self.device)
-        yaw_p = yaw_d + gs_rand_float(-dr.init_rel_yaw * init_lvl, dr.init_rel_yaw * init_lvl, (n, ), self.device)
-        yaw_quat = lambda y: torch.stack([torch.cos(y/2), torch.zeros_like(y), torch.zeros_like(y), torch.sin(y/2)], dim=-1)
-
-        # Velocities
-        v_d = dr.init_drone_vel * init_lvl * torch.randn((n, 3), device=self.device)
-        u = torch.randn((n, 3), device=self.device)
-        u = u - (u * r_hat).sum(-1, keepdim=True) * r_hat
-        v_rel = u / torch.clamp(torch.norm(u, dim=-1, keepdim=True), min=EPS) * (dr.init_swing_rate * init_lvl * L).unsqueeze(-1) * torch.rand((n, 1), device=self.device)
-        v_p = v_d + v_rel
-
-        return drone_pos, yaw_quat(yaw_d), v_d, payload_pos, yaw_quat(yaw_p), v_p
-
     def _draw_target(self, envs_idx):
-        # Viewer-only target from env 0's command: sphere at [x, y, z], arrow along yaw_ref pointing outward from the sphere
-        # (debug objects only exist in the viewer, which renders env 0)
-        if not self.show_viewer or not (envs_idx == 0).any():
-            return
-        radius, arrow_len = 0.05, 0.3
-        pos = self.commands[0, :3].cpu().numpy().astype(np.float32)
-        yaw_ref = self.commands[0, 3].item()
-        heading = np.array([math.cos(yaw_ref), math.sin(yaw_ref), 0.0], dtype=np.float32)
-        arrow_pos = pos + radius * heading
-
-        if not self.target_debug_objs:
-            self.target_debug_objs = [
-                self.scene.draw_debug_sphere(pos=pos.tolist(), radius=radius, color=(1.0, 0.0, 0.0, 1.0)),
-                self.scene.draw_debug_arrow(pos=arrow_pos.tolist(), vec=(arrow_len * heading).tolist(), radius=0.008, color=(0.0, 0.0, 0.0, 1.0)),
-            ]
-            return
-        # Move the existing nodes: clearing and re-drawing every step rebuilds meshes under the viewer lock (~40% of sim rate)
-        self.scene.update_debug_objects(self.target_debug_objs, (gu.trans_to_T(pos), gu.trans_R_to_T(arrow_pos, gu.z_up_to_R(heading))))
-
-    def _attach_viewer_logs(self):
-        # The viewer paces one sim_dt per update, but step() updates it once per decimation substeps: scale to stay real time
-        self.scene.viewer.realtime_factor = self.decimation
-        # Viewer-only text overlay of env 0 state (see utils.attach_log). Buffers are heading frame
-        attach_sim_rate(self.scene)
-        attach_log(self.scene, "|pos err| [m]", lambda: torch.norm(self.payload_pos_err, dim=1))
-        attach_log(self.scene, "payload |v| [m/s]", lambda: torch.norm(self.payload_vel, dim=1))
-        attach_log(self.scene, "payload yaw error [deg]", lambda: torch.rad2deg(self.payload_yaw_err))
-        attach_log(self.scene, "reward", lambda: self.rew_buf, fmt="{:+.3f}")
-
-    def _reward_track(self):
-        # Sharper gradient closer to the target but avoiding completely flat gradient further away
-        dist = torch.norm(self.payload_pos_err, dim=1)
-        track_rew = torch.exp(-dist / self.rew_cfg.sigma_track_rough) * self.rew_cfg.w_track_rough
-        track_rew += torch.exp(-dist / self.rew_cfg.sigma_track_fine) * self.rew_cfg.w_track_fine
-        return track_rew
-
-    def _reward_vmax(self):
-        overspeed = torch.clamp(torch.norm(self.payload_vel, dim=1) - self.rew_cfg.v_max, min=0.0)
-        vmax_rew = torch.square(overspeed) * self.rew_cfg.w_vmax 
-        return vmax_rew
-
-    def _reward_damping(self):
-        # Penalise payload speed only near the target: forces braking without slowing the approach
-        # NOTE: assumes a static setpoint. for trajectory tracking use (payload_vel - ref_vel) instead
-        dist = torch.norm(self.payload_pos_err, dim=1)
-        speed = torch.norm(self.payload_vel, dim=1)
-        damping_rew = speed * torch.exp(-dist / self.rew_cfg.sigma_damping) * self.rew_cfg.w_damping
-        return damping_rew
-
-    def _reward_swing_energy(self):
-        # Linear in amplitude so small residual swing near the target is still penalised
-        swing_energy_rew = self.swing_amp * self.rew_cfg.w_swing_energy
-        return swing_energy_rew
-
-    def _reward_yaw(self):
-        # Payload heading tracking, pseudo-Huber: linear outside delta so small errors are still worth correcting,
-        # quadratic inside so the pull fades near zero instead of driving bang-bang yaw commands
-        d = self.rew_cfg.delta_yaw
-        yaw_rew = (torch.sqrt(torch.square(self.payload_yaw_err) + d**2) - d) * self.rew_cfg.w_yaw
-        return yaw_rew
-
-    def _reward_yaw_damping(self):
-        # Yaw analogue of _reward_damping: penalise payload yaw rate only near the yaw target, so turning past it is
-        # worse than arriving slowly (braking) and residual twist swing at the target costs. Drone yaw is left free
-        d = self.rew_cfg.delta_yaw_damping
-        yaw_rate = self.payload_body_rates[:, 2] # payload tilt stays small, so body z ~ world z
-        gate = torch.exp(-torch.abs(self.payload_yaw_err) / self.rew_cfg.sigma_yaw_damping)
-        yaw_damping_rew = (torch.sqrt(torch.square(yaw_rate) + d**2) - d) * gate * self.rew_cfg.w_yaw_damping
-        return yaw_damping_rew
-
-    def _reward_tilt(self):
-        # Payload attitude away from level: 1 - cos(tilt) ~ tilt²/2, so small tilts during manoeuvres are nearly free
-        # (unlike the linear swing term) while large tilts are increasingly penalised
-        tilt_rew = (1.0 + self.payload_proj_g[:, 2]) * self.rew_cfg.w_tilt
-        return tilt_rew
-
-    def _reward_action_bound(self):
-        # Pre-clip actions beyond the clip bound: once the policy mean sits past the bound every sample clips to the same
-        # value, so PPO gets no gradient to bring it back (saturation trap). Zero inside the bound
-        excess = torch.clamp(torch.abs(self.actions_raw) - self.cfg.clip_actions, min=0.0)
-        action_bound_rew = torch.sum(torch.square(excess), dim=1) * self.rew_cfg.w_action_bound
-        return action_bound_rew
-
-    def _reward_smooth_actions(self):
-        # Per-axis weights (w_smooth_actions: [thrust, roll, pitch, yawrate])
-        action_rew = torch.sum(torch.square(self.actions - self.prev_actions) * self.w_smooth_actions, dim=1)
-        return action_rew
-
-    def _reward_on_trajectory(self):
-        traj_rew = 0.0
-        # Some error between line-segment between trajectory setpoints. 
-        # Distance from payload projected onto line (3D)
-        # Will it be any different than simply following the line from payload pos to target pos - i dont think so??
-        
-        return traj_rew
-
-    def _reward_crash(self):
-        crash_rew = torch.zeros((self.num_envs, ), device=self.device, dtype=gs.tc_float)
-        crash_rew[self.crash_condition] = self.rew_cfg.w_crash
-        return crash_rew
-
-    def _compute_reward(self):
-        self.rew_buf[:] = 0.0
-        for name, fn in self.reward_fns.items():
-            rew = fn()
-            self.rew_buf += rew
-            self.episode_sums[name] += rew
+        # Viewer-only target of env 0's command (the viewer renders env 0)
+        if self.target_marker is not None and (envs_idx == 0).any():
+            self.target_marker.update(self.commands[0])
