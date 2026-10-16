@@ -110,7 +110,7 @@ class PayloadControlEnv(RewardsMixin):
                 camera_pos=(0.0, 7.0, 3.0),
                 camera_lookat=(0.0, 0.0, 2.0),
                 camera_fov=60,
-                refresh_rate=30,
+                # refresh_rate=30,
             ),
             vis_options=gs.options.VisOptions(
                 rendered_envs_idx=list(range(1)),
@@ -168,10 +168,12 @@ class PayloadControlEnv(RewardsMixin):
         self.rigid_solver = self.scene.sim.rigid_solver
         self.tether_links_idx = torch.tensor([link.idx for link in self.drone_attach_links + self.payload_attach_links], device=self.device, dtype=gs.tc_int) # [drone..., payload...]
         self.base_links_idx = torch.tensor([self.drone.base_link_idx, self.payload.base_link_idx], device=self.device, dtype=gs.tc_int) # [drone, payload]
+        
         # Free joints only, see reset_idx: qpos [pos, quat] equals the base link pose (base links have no inertial offset)
         assert self.drone.n_qs == 7 and self.payload.n_qs == 7 and self.drone.n_dofs == 6 and self.payload.n_dofs == 6
         self.base_qs_idx = list(range(self.drone.q_start, self.drone.q_end)) + list(range(self.payload.q_start, self.payload.q_end))
         self.base_dofs_idx = list(range(self.drone.dof_start, self.drone.dof_end)) + list(range(self.payload.dof_start, self.payload.dof_end))
+        
         # Mass-carrying links of [drone..., payload...], see _apply_masses (same selection as entity.set_mass)
         drone_mass_links = [link.idx for link in self.drone.links if not link.is_fixed]
         self.mass_links_idx = drone_mass_links + [link.idx for link in self.payload.links if not link.is_fixed]
@@ -227,7 +229,7 @@ class PayloadControlEnv(RewardsMixin):
 
     def get_observations(self):
         return TensorDict({
-            "policy": self.obs_buf, # noisy
+            "policy": self.obs_buf, # TODO: noisy
             "critic": self.critic_obs_buf, # clean + priv obs
         }, batch_size=[self.num_envs])
 
@@ -240,7 +242,7 @@ class PayloadControlEnv(RewardsMixin):
 
     def step(self, actions):
         self.actions_raw = actions # pre-clip policy sample, for the action bound penalty
-        self.actions, substep_sps = self._setpoints_fn(actions)
+        self.actions, substep_sps = self._setpoints_fn(actions) # clipped actions
 
         # Setpoints held constant (zero-order hold) while the inner loop runs at sim rate
         # Viewer refreshed on the last substep only (policy rate), see viewer.attach_viewer_logs for the matching pacing
