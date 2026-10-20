@@ -11,14 +11,17 @@ from components.math_utils import rotate_to_heading, wrap_angle, rotate_by_quat,
 from components.tether import TetherModel
 from components.flight_control import FlightController
 from components.domain_rand import DomainRandomizer
+from components.reference import TrajectoryBank, ReferenceTrajectory
 from components.rewards import RewardsMixin
-from components.viewer import TargetMarker, attach_viewer_logs
+from components.viewer import TargetMarker, RoutePath, PreviewMarkers, attach_viewer_logs
 
 class PayloadControlEnv(RewardsMixin):
-    # Drone carrying a tethered payload; the policy commands [thrust, roll, pitch, yaw rate] to move the payload to a target.
-    # Components: FlightController (action -> RPM), TetherModel (suspension wrench), DomainRandomizer (per-episode params
-    # and initial state), RewardsMixin (reward terms). Only this class talks to the Genesis scene/solver
-    def __init__(self, env_cfg: EnvConfig, show_viewer: bool=False, device: str="cuda"):
+    # Drone carrying a tethered payload; the policy commands [thrust, roll, pitch, yaw rate] so the payload tracks a
+    # reference trajectory. Components: FlightController (action -> RPM), TetherModel (suspension wrench),
+    # DomainRandomizer (per-episode params and initial state), ReferenceTrajectory (per-env route from the trajectory
+    # bank, its clock and yaw reference), RewardsMixin (reward terms). Only this class talks to the Genesis scene/solver
+    def __init__(self, env_cfg: EnvConfig, show_viewer: bool=False, device: str="cuda", bank: TrajectoryBank=None):
+        # bank: routes to draw from; None loads the trajectory bank of the configs (evaluations pass their own)
         self.show_viewer = show_viewer
         self.device = torch.device(device)
 
@@ -31,7 +34,7 @@ class PayloadControlEnv(RewardsMixin):
         self.max_episode_length = math.ceil(self.cfg.episode_length_s / self.dt)
 
         self.sys_cfg = self.cfg.sys_cfg
-        self.cmd_cfg = self.cfg.cmd_cfg
+        self.ref_cfg = self.cfg.ref_cfg
         self.rew_cfg = self.cfg.rew_cfg
 
         self._build_scene()
@@ -67,6 +70,12 @@ class PayloadControlEnv(RewardsMixin):
             device=self.device
         )
 
+        # Payload reference: routes solved offline (utils/build_bank.py builds the bank for the current configs), placed
+        # per env at reset; ref_offsets are the current point and the preview times
+        self.bank = bank if bank is not None else TrajectoryBank.load(self.cfg.bank_cfg, self.cfg.route_cfg, self.cfg.sampler_cfg, device=self.device)
+        self.ref = ReferenceTrajectory(self.bank, self.num_envs, self.device, self.ref_cfg, compile=self.cfg.torch_compile)
+        self.ref_offsets = torch.tensor((0.0, *self.ref_cfg.preview_s), device=self.device, dtype=gs.tc_float)
+
         # The env's torch code is hundreds of tiny ops, bound by Python dispatch and kernel launches regardless of num_envs.
         # torch.compile fuses each stage into a few kernels (first steps are slow while it compiles). Wrap stages here only:
         # helpers they call (components, math_utils) are inlined into the stage, so a separately compiled helper only adds dispatch
@@ -81,7 +90,11 @@ class PayloadControlEnv(RewardsMixin):
         self._init_buffers()
         self._init_rewards()
 
+        # Viewer-only drawing of env 0's reference: current point and yaw reference, preview points, full route
         self.target_marker = TargetMarker(self.scene) if self.show_viewer else None
+        self.preview_markers = PreviewMarkers(self.scene, len(self.ref_cfg.preview_s)) if self.show_viewer else None
+        self.route_path = RoutePath(self.scene) if self.show_viewer else None
+        self.ref_points0 = None # env 0's reference now and at the preview times (1+K, 3), kept for the viewer
         if self.show_viewer:
             attach_viewer_logs(self)
 
@@ -187,22 +200,25 @@ class PayloadControlEnv(RewardsMixin):
         s = self.cfg.obs_scales
         self.pos_obs_scale = torch.tensor([s.px, s.py, s.pz], device=self.device, dtype=gs.tc_float)
         self.vel_obs_scale = torch.tensor([s.vx, s.vy, s.vz], device=self.device, dtype=gs.tc_float)
+        # Preview point k ~ v * τ_k + error away: scaled by the distance it can plausibly reach, so far points don't saturate
+        self.preview_obs_scale = 1.0 / (self.cfg.sampler_cfg.v_des_max * self.ref_offsets[1:] + s.preview_margin)
 
         # Environment state buffers
         self.obs_buf = zeros(self.cfg.num_obs)
-        self.critic_obs_buf = zeros(self.cfg.num_obs + 8) # obs + DomainRandomizer.privileged_obs
+        self.critic_obs_buf = zeros(self.cfg.num_obs + self.cfg.num_privileged_obs) # obs + DomainRandomizer.privileged_obs
         self.reset_buf = zeros(dtype=gs.tc_int)
         self.episode_length_buf = zeros(dtype=gs.tc_int)
-        self.commands = zeros(self.cmd_cfg.num_commands)
         self.actions = zeros(self.num_actions)
         self.prev_actions = zeros(self.num_actions)
         self.actions_raw = zeros(self.num_actions)
         self.crash_condition = zeros(dtype=gs.tc_bool)
 
         # Observation state buffers
-        self.payload_pos_err = zeros(3) # Drone heading frame (RTK)
-        self.payload_prev_pos_err = zeros(3)
-        self.payload_yaw_err = zeros() # wrap(yaw_ref - payload yaw)
+        self.payload_pos_err = zeros(3) # reference - payload, drone heading frame (RTK)
+        self.payload_vel_err = zeros(3) # reference velocity - payload velocity, drone heading frame
+        self.payload_preview = zeros(len(self.ref_cfg.preview_s), 3) # reference at τ + τ_k - payload, drone heading frame
+        self.payload_yaw_err = zeros() # wrap(psi_ref - payload yaw)
+        self.yaw_rate_ref = zeros() # yaw-rate reference psi_dot_ref
         self.payload_vel = zeros(3) # Drone heading frame (RTK)
         self.payload_proj_g = zeros(3) # Gravity in payload body axes
         self.payload_body_rates = zeros(3) # Body frame (IMU gyro)
@@ -214,12 +230,16 @@ class PayloadControlEnv(RewardsMixin):
 
         # Non-observations
         self.payload_pos = zeros(3) # world, for ground crash
+        self.ref_pos = zeros(3) # world, current reference point (viewer)
         self.drone_yaw = zeros() # abs drone yaw
         self.swing_amp = zeros() # equivalent pendulum amplitude [rad]
 
-        # Success rate, see _post_step and _log_success_rate
-        self.win_steps = int(self.cfg.dr_cfg.success_window_s / self.dt)
-        self.win_err = zeros()
+        # Per-episode tracking accumulators (success rate and Task/ logs), see _post_step and _log_episode_tracking
+        self.ep_err_sum = zeros()
+        self.ep_err_sq_sum = zeros()
+        self.ep_err_max = zeros()
+        self.ep_swing_sum = zeros()
+        self.ep_steps = zeros()
         self.success_count = torch.zeros((), device=self.device)
         self.episode_count = torch.zeros((), device=self.device)
         self.success_steps = 0 # policy steps into the current success window
@@ -239,6 +259,7 @@ class PayloadControlEnv(RewardsMixin):
         self.reset_idx(torch.arange(self.num_envs, device=self.device))
         self._update_buffers()
         self._update_observations()
+        self._draw_reference()
         return self.get_observations()
 
     def step(self, actions):
@@ -251,6 +272,7 @@ class PayloadControlEnv(RewardsMixin):
             self._sim_step(substep_sps[i], update_visualizer=(i == self.decimation - 1))
 
         self.episode_length_buf += 1
+        self.ref.step(self.dt) # reference clock and yaw follower, so the errors below compare the same instant
 
         self._update_buffers()
         self.extras["time_outs"] = self._post_step_fn()
@@ -259,6 +281,7 @@ class PayloadControlEnv(RewardsMixin):
         self._update_buffers() # update again to catch initial states (cheap but could be guarded)
         self._update_observations()
         self.prev_actions = self.actions
+        self._draw_reference()
 
         self._log_success_rate()
 
@@ -270,11 +293,23 @@ class PayloadControlEnv(RewardsMixin):
             return
 
         self._log_episode_rewards(envs_idx)
+        self._log_episode_tracking(envs_idx)
 
-        # New system parameters and initial state
+        # New system parameters
         self.dr.randomize(envs_idx)
         self._apply_masses(envs_idx)
-        drone_pos, drone_quat, drone_vel, payload_pos, payload_quat, payload_vel = self.dr.sample_initial_state(envs_idx)
+
+        # New route (each env is its own world, so every route starts at the origin), then the initial state moved onto
+        # its start point and moving with it (mid-route starts). Payload heading within init_yaw_err of the yaw reference
+        n = len(envs_idx)
+        ref_pos0, ref_vel0 = self.ref.assign_random(envs_idx, torch.zeros((n, 2), device=self.device), p_mid_route=self.ref_cfg.p_mid_route_start)
+        self._draw_route(envs_idx)
+        yaw_err = self.ref_cfg.init_yaw_err * (1.0 if self.dr.enabled else 0.0)
+        payload_yaw = wrap_angle(self.ref.psi_ref[envs_idx] + gs_rand_float(-yaw_err, yaw_err, (n, ), self.device))
+        drone_pos, drone_quat, drone_vel, payload_pos, payload_quat, payload_vel = self.dr.sample_initial_state(envs_idx, payload_yaw)
+        shift = ref_pos0 - self.payload_init_pos
+        drone_pos, payload_pos = drone_pos + shift, payload_pos + shift
+        drone_vel, payload_vel = drone_vel + ref_vel0, payload_vel + ref_vel0
 
         # Reset drone and payload together through their free joints. Forward kinematics runs once, in the qpos write
         zeros = torch.zeros_like(drone_vel)
@@ -284,10 +319,8 @@ class PayloadControlEnv(RewardsMixin):
 
         self.ctrl.reset(envs_idx, drone_quat)
 
-        # Commands (yaw_ref sampled relative to the reset payload heading)
-        self._resample_commands(envs_idx, quat_yaw(payload_quat))
-
-        self.win_err[envs_idx] = 0.0
+        for buf in (self.ep_err_sum, self.ep_err_sq_sum, self.ep_err_max, self.ep_swing_sum, self.ep_steps):
+            buf[envs_idx] = 0.0
         self.actions[envs_idx] = 0
         self.prev_actions[envs_idx] = 0
         self.episode_length_buf[envs_idx] = 0
@@ -326,9 +359,14 @@ class PayloadControlEnv(RewardsMixin):
         quat = self.rigid_solver.get_links_quat(self.base_links_idx, relative=True)
         vel = self.rigid_solver.get_links_vel(self.base_links_idx, relative=True)
         ang = self.rigid_solver.get_links_ang(self.base_links_idx)
-        self._buffers_fn(pos, quat, vel, ang)
+        # Reference at τ + ref_offsets (world): current point and preview, outside the compiled stage (searchsorted/gather)
+        ref_pos, ref_vel = self.ref.eval(self.ref_offsets, max_order=1)
+        if self.show_viewer:
+            self.ref_points0 = ref_pos[0]
+        self._buffers_fn(pos, quat, vel, ang, ref_pos, ref_vel[:, 0], self.ref.psi_ref, self.ref.psi_dot_ref)
 
-    def _compute_buffers(self, pos, quat, vel, ang):
+    def _compute_buffers(self, pos, quat, vel, ang, ref_pos, ref_vel, psi_ref, psi_dot_ref):
+        # ref_pos (N, 1+K, 3): reference now and at the preview times; ref_vel (N, 3): reference velocity now
         drone_pos, payload_pos = pos.unbind(1)
         drone_quat, payload_quat = quat.unbind(1)
         drone_vel, payload_vel = vel.unbind(1)
@@ -343,9 +381,12 @@ class PayloadControlEnv(RewardsMixin):
         # Payload tracking and attitude
         payload_yaw = quat_yaw(payload_quat)
         self.payload_pos[:] = payload_pos
-        self.payload_prev_pos_err[:] = self.payload_pos_err # last update's error: step()'s reward runs after its first update
-        self.payload_pos_err[:] = rotate_to_heading(self.commands[:, :3] - payload_pos, yaw)
-        self.payload_yaw_err[:] = wrap_angle(self.commands[:, 3] - payload_yaw) # can wrap: observed as sin/cos
+        self.ref_pos[:] = ref_pos[:, 0]
+        self.payload_pos_err[:] = rotate_to_heading(ref_pos[:, 0] - payload_pos, yaw)
+        self.payload_vel_err[:] = rotate_to_heading(ref_vel - payload_vel, yaw)
+        self.payload_preview[:] = rotate_to_heading(ref_pos[:, 1:] - payload_pos[:, None], yaw[:, None])
+        self.payload_yaw_err[:] = wrap_angle(psi_ref - payload_yaw) # can wrap: observed as sin/cos
+        self.yaw_rate_ref[:] = psi_dot_ref
         self.payload_vel[:] = rotate_to_heading(payload_vel, yaw)
         self.payload_proj_g[:] = rotate_by_quat(self.world_down, payload_quat, inverse=True)
         self.payload_body_rates[:] = rotate_by_quat(payload_ang, payload_quat, inverse=True)
@@ -384,10 +425,15 @@ class PayloadControlEnv(RewardsMixin):
         timeout = self._update_crash_conditions()
         self._compute_reward()
 
-        # Success: episode survived to timeout with the payload near the target
-        in_win = (self.episode_length_buf > self.max_episode_length - self.win_steps).float()
-        self.win_err += in_win * torch.norm(self.payload_pos_err, dim=1)
-        success = self.reset_buf & ~self.crash_condition & (self.win_err / self.win_steps < self.cfg.dr_cfg.success_pos_err)
+        # Episode accumulators. Success: survived to timeout with a small mean error to the reference
+        err = torch.norm(self.payload_pos_err, dim=1)
+        self.ep_err_sum += err
+        self.ep_err_sq_sum += torch.square(err)
+        self.ep_err_max[:] = torch.maximum(self.ep_err_max, err)
+        self.ep_swing_sum += self.swing_amp
+        self.ep_steps += 1.0
+        mean_err = self.ep_err_sum / torch.clamp(self.ep_steps, min=1.0)
+        success = self.reset_buf & ~self.crash_condition & (mean_err < self.cfg.dr_cfg.success_pos_err)
         self.success_count += success.sum()
         self.episode_count += self.reset_buf.sum()
         return timeout
@@ -411,6 +457,19 @@ class PayloadControlEnv(RewardsMixin):
         self.reset_buf = timeout | self.crash_condition
         return timeout
 
+    def _log_episode_tracking(self, envs_idx):
+        # Tracking quality of the finished episodes of envs_idx (means over envs), before their accumulators restart
+        steps = torch.clamp(self.ep_steps[envs_idx], min=1.0)
+        duration = self.ref.duration[envs_idx]
+        completion = torch.where(duration > 0.0, torch.clamp(self.ref.tau[envs_idx] / torch.clamp(duration, min=EPS), max=1.0), 1.0)
+        ep = self.extras["episode"]
+        ep["Task/mean_pos_err"] = torch.mean(self.ep_err_sum[envs_idx] / steps)
+        ep["Task/rms_pos_err"] = torch.mean(torch.sqrt(self.ep_err_sq_sum[envs_idx] / steps))
+        ep["Task/max_pos_err"] = torch.mean(self.ep_err_max[envs_idx])
+        ep["Task/mean_swing_deg"] = torch.rad2deg(torch.mean(self.ep_swing_sum[envs_idx] / steps))
+        ep["Task/crash_rate"] = torch.mean(self.crash_condition[envs_idx].float())
+        ep["Task/route_completion"] = torch.mean(completion)
+
     def _log_success_rate(self):
         # Fraction of episodes ending in success over each window of success_interval policy steps
         self.success_steps += 1
@@ -421,7 +480,7 @@ class PayloadControlEnv(RewardsMixin):
         self.episode_count.zero_()
         self.success_steps = 0
 
-    # ======================== OBSERVATIONS / COMMANDS ========================
+    # ======================== OBSERVATIONS ========================
 
     def _update_observations(self):
         self.obs_buf, self.critic_obs_buf = self._observations_fn()
@@ -432,8 +491,10 @@ class PayloadControlEnv(RewardsMixin):
         obs = torch.cat(
             [
                 # Task (heading frame)
-                torch.clamp(self.payload_pos_err * self.pos_obs_scale, -1.0, 1.0), # payload pos err, dim=3
+                torch.clamp(self.payload_pos_err * self.pos_obs_scale, -1.0, 1.0), # payload pos err to the reference, dim=3
                 torch.clamp(self.payload_vel * self.vel_obs_scale, -1.0, 1.0), # payload vel, dim=3
+                torch.clamp(self.payload_vel_err * s.v_err, -1.0, 1.0), # reference vel - payload vel, dim=3
+                torch.clamp(self.payload_preview * self.preview_obs_scale[None, :, None], -1.0, 1.0).flatten(1), # preview, dim=3K
 
                 # Payload dim=13
                 self.payload_proj_g, # gravity in payload body axes, dim=3
@@ -441,8 +502,10 @@ class PayloadControlEnv(RewardsMixin):
                 torch.clamp(self.payload_swing_angles * s.pl_swing_angles, -1.0, 1.0), # swing angles (heading frame), dim=2
                 torch.clamp(self.payload_swing_angles_rates * s.pl_swing_angles_rates, -1.0, 1.0), # swing angles rates (heading frame), dim=2
                 torch.clamp(self.drone_payload_rel_yaw.unsqueeze(-1) * s.rel_yaw, -1.0, 1.0), # drone-payload relative yaw, dim=1
+                
                 torch.sin(self.payload_yaw_err).unsqueeze(-1), # payload yaw err, dim=1
                 torch.cos(self.payload_yaw_err).unsqueeze(-1), # -- dim=1
+                torch.clamp(self.yaw_rate_ref.unsqueeze(-1) / self.sys_cfg.max_yaw_rate, -1.0, 1.0), # yaw-rate reference, dim=1
                 
                 # Drone
                 self.drone_proj_g, # gravity in drone body axes, dim=3
@@ -453,20 +516,17 @@ class PayloadControlEnv(RewardsMixin):
         )
         return obs, torch.cat([obs, self.dr.privileged_obs()], dim=-1)
 
-    def _resample_commands(self, envs_idx, payload_yaw0, n=1):
-        if len(envs_idx) == 0:
+    def _draw_reference(self):
+        # Viewer-only, every step: env 0's current reference point and yaw reference, and the preview points it observes
+        if self.target_marker is not None:
+            self.target_marker.update(torch.cat([self.ref_pos[0], self.ref.psi_ref[:1]]))
+            self.preview_markers.update(self.ref_points0[1:])
+
+    def _draw_route(self, envs_idx, spacing_s=0.1, max_points=1000):
+        # Viewer-only, when env 0 gets a new route: its full reference path, sampled every spacing_s
+        if self.route_path is None or not (envs_idx == 0).any():
             return
-        # TODO: Make n the number of close waypoint in n-horizon trajectory
-        pl_init = self.payload_init_pos
-        self.commands[envs_idx, 0] = gs_rand_float(pl_init[0] - self.cmd_cfg.pos_x_range, pl_init[0] + self.cmd_cfg.pos_x_range, shape=(len(envs_idx), ), device=self.device)
-        self.commands[envs_idx, 1] = gs_rand_float(pl_init[1] - self.cmd_cfg.pos_y_range, pl_init[1] + self.cmd_cfg.pos_y_range, shape=(len(envs_idx), ), device=self.device)
-        self.commands[envs_idx, 2] = gs_rand_float(pl_init[2] - self.cmd_cfg.pos_z_range, pl_init[2] + self.cmd_cfg.pos_z_range, shape=(len(envs_idx), ), device=self.device)
-        yaw_max = self.cmd_cfg.yaw_range
-        self.commands[envs_idx, 3] = wrap_angle(payload_yaw0 + gs_rand_float(-yaw_max, yaw_max, shape=(len(envs_idx), ), device=self.device))
-
-        self._draw_target(envs_idx)
-
-    def _draw_target(self, envs_idx):
-        # Viewer-only target of env 0's command (the viewer renders env 0)
-        if self.target_marker is not None and (envs_idx == 0).any():
-            self.target_marker.update(self.commands[0])
+        duration = self.ref.duration[0].item()
+        n = int(min(max(duration / spacing_s, 2), max_points)) if duration > 0.0 else 0
+        t = torch.linspace(0.0, duration, max(n, 1), device=self.device) - self.ref.tau[0]
+        self.route_path.set(self.ref.eval(t, max_order=0, env_ids=torch.zeros(1, device=self.device, dtype=torch.long))[0, 0][:n])

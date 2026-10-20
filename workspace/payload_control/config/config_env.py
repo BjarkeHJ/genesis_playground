@@ -30,10 +30,9 @@ class DomainRandConfig:
     init_drone_vel: float = 0.5
     init_rel_yaw: float = math.radians(10.0)
 
-    # Success rate (logging only): episode reaches timeout without crash, payload near the target at the end
+    # Success rate (logging only): episode reaches timeout without crash, mean payload error to the reference below this
     success_interval: int = 1200 # policy steps per success window
-    success_window_s: float = 3.0 # 150 policy steps
-    success_pos_err: float = 0.25 # final payload pos error that counts as success (trained policy settles to ~0.05 m)
+    success_pos_err: float = 0.3 # mean payload pos error over the episode that counts as success [m]
 
 # ====== TETHER CONFIG ======
 @dataclass(frozen=True)
@@ -43,7 +42,7 @@ class SystemConfig:
     stiffness: float = 1500.0
     damping: float = 200.0
     torsional_damping: float = 2e-4 # suspension yaw friction on the drone-payload relative yaw rate [N·m·s/rad]
-    rest_length: float = 5.0
+    rest_length: float = 2.0
     activation_delta: float = 0.2
 
     # Payload
@@ -75,17 +74,7 @@ class SystemConfig:
         object.__setattr__(self, "drone_reset_pos", (0.0, 0.0, self.payload_init_z + self.rest_length)) # start approx at suspension
 
 
-# ====== COMMAND CONFIG =======
-@dataclass(frozen=True)
-class CommandConfig:
-    num_waypoints: int = 3
-    num_commands: int = 4 # [x, y, z, yaw_ref]
-
-    pos_x_range: float = 3.0
-    pos_y_range: float = 3.0
-    pos_z_range: float = 2.0
-    yaw_range: float = math.radians(90.0) # yaw_ref around initial payload heading
-
+# ====== ROUTE SAMPLER CONFIG =======
 @dataclass(frozen=True)
 class RouteSamplerConfig:
     route_keywords: tuple[str, ...] = ("random", "survey", "loop", "zigzag", "stop")
@@ -121,11 +110,19 @@ class RouteConfig:
 @dataclass(frozen=True)
 class ReferenceConfig:
     # Online per-env reference on top of the bank (not part of the bank's cache key). Yaw is not optimized with the
-    # position: a rate-limited follower turns the yaw reference towards the reference velocity direction
-    yaw_mode: str = "velocity" # "velocity": follow the reference velocity direction | "fixed": hold the initial heading
+    # position: a rate-limited follower turns the yaw reference towards the direction of the reference velocity,
+    # averaged over a lookahead window so slow yaw turns start before the corner
+    yaw_mode: str = "velocity" # "velocity": follow the (lookahead) velocity direction | "fixed": hold the initial heading
     yaw_tau: float = 0.75 # follower time constant [s]: larger follows corners more loosely
     yaw_rate_max: float = math.radians(30.0) # yaw-rate reference limit, below SystemConfig.max_yaw_rate (45°/s) to leave room for corrections
-    yaw_min_speed: float = 0.3 # below this horizontal reference speed the yaw reference holds (stops, hover) [m/s]
+    yaw_min_speed: float = 0.3 # below this (lookahead) horizontal reference speed the yaw reference holds (stops, hover) [m/s]
+    yaw_lookahead_s: float = 2.0 # window [0, H] of future reference velocities averaged for the heading target; 0: current velocity [s]
+    yaw_lookahead_decay: float = 1.0 # weights exp(-t / decay) over the window: the near future dominates [s]
+
+    # Observation and reset
+    preview_s: tuple[float, ...] = (0.5, 1.0, 2.0, 3.0) # preview points r(τ + τ_k) - payload, observed in the heading frame [s]
+    p_mid_route_start: float = 0.0 # chance an episode starts at a uniform time along its route instead of the start
+    init_yaw_err: float = math.radians(90.0) # initial payload yaw within this of the yaw reference
 
 # ====== TRAJECTORY BANK CONFIG ======
 @dataclass(frozen=True)
@@ -143,9 +140,11 @@ class ObservationScales:
     px: float = 1.0 / 3.0
     py: float = 1.0 / 3.0
     pz: float = 1.0 / 3.0
-    vx: float = 1.0 / 10.0
-    vy: float = 1.0 / 10.0
-    vz: float = 1.0 / 10.0
+    vx: float = 1.0 / 6.0
+    vy: float = 1.0 / 6.0
+    vz: float = 1.0 / 6.0
+    v_err: float = 1.0 / 3.0 # reference velocity - payload velocity
+    preview_margin: float = 3.0 # preview point k is scaled by 1 / (v_des_max * τ_k + preview_margin): far points don't saturate [m]
     pl_body_rates: float = 1.0 / math.pi # size?
     pl_swing_angles: float = 1.0 / math.radians(60.0) # = 1 / terminate_if_swingangle_greater_than
     pl_swing_angles_rates: float = 1.0 / 1.0 # measure?
@@ -159,17 +158,14 @@ class RewardConfig:
     sigma_track_fine: float = 0.3
     w_track: float = 1.0
 
-    w_progress: float = 0.1 # per m²/s of closing squared distance (2 m/s at 3 m ~ 1.2 per step)
-    
-    sigma_damping: float = 0.5 # gate on payload speed penalty near the target [m]
-    w_damping: float = -0.75 # per m/s of payload speed at the target
+    delta_vel_track: float = 0.2 # pseudo-Huber knee on |reference velocity - payload velocity| [m/s]
+    w_vel_track: float = -0.5 # per m/s of velocity error (outside the knee). At the route end v_ref = 0: the old damping term
         
     delta_yaw: float = 0.2 # pseudo-Huber knee on payload yaw err: quadratic inside, linear outside [rad]
     w_yaw: float = -0.3 # per rad of payload yaw err (outside the knee)
 
-    sigma_yaw_damping: float = 0.3 # gate on payload yaw rate penalty near the yaw target [rad]
-    delta_yaw_damping: float = 0.2 # pseudo-Huber knee on payload yaw rate [rad/s]
-    w_yaw_damping: float = -0.3 # per rad/s of payload yaw rate at the yaw target (outside the knee)
+    delta_yaw_rate_track: float = 0.2 # pseudo-Huber knee on payload yaw rate - yaw-rate reference [rad/s]
+    w_yaw_rate_track: float = -0.3 # per rad/s of yaw-rate error (outside the knee)
     
     w_swing_energy: float = -1.0 # per rad of equivalent swing amplitude
     w_tilt: float = -1.0 # per (1 - cos(payload tilt))
@@ -183,7 +179,10 @@ class RewardConfig:
 @dataclass(frozen=True)
 class EnvConfig:
     sys_cfg: SystemConfig = field(default_factory=SystemConfig)
-    cmd_cfg: CommandConfig = field(default_factory=CommandConfig)
+    route_cfg: RouteConfig = field(default_factory=RouteConfig)
+    sampler_cfg: RouteSamplerConfig = field(default_factory=RouteSamplerConfig)
+    bank_cfg: TrajectoryBankConfig = field(default_factory=TrajectoryBankConfig)
+    ref_cfg: ReferenceConfig = field(default_factory=ReferenceConfig)
     rew_cfg: RewardConfig = field(default_factory=RewardConfig)
     dr_cfg: DomainRandConfig = field(default_factory=DomainRandConfig)
     obs_scales: ObservationScales = field(default_factory=ObservationScales)
@@ -199,7 +198,8 @@ class EnvConfig:
     torch_compile: bool = True # fuse the per-sim-step torch code (controllers, tethers); costs compile time at startup
 
     # Policy input and output layer dim
-    num_obs: int = 29
+    num_obs: int = field(init=False) # 33 + 3 per preview point, see PayloadControlEnv._compute_observations
+    num_privileged_obs: int = 8 # critic only, DomainRandomizer.privileged_obs
     num_actions: int = 4
 
     # Actions
@@ -210,9 +210,9 @@ class EnvConfig:
     episode_length_s: float = 20.0
     terminate_if_payload_tilt_greater_than: float = math.pi / 4.0
     terminate_if_swingangle_greater_than: float = math.radians(60.0)
-    terminate_if_x_greater_than: float = 7.0 # on pl pos err (bbox around target, heading frame)
-    terminate_if_y_greater_than: float = 7.0
-    terminate_if_z_greater_than: float = 7.0
+    terminate_if_x_greater_than: float = 3.0 # on pl pos err (bbox around the moving reference, heading frame)
+    terminate_if_y_greater_than: float = 3.0
+    terminate_if_z_greater_than: float = 3.0
     terminate_if_relyaw_greater_than: float = 0.75 * math.pi # below pi so the wrapped rel yaw never wraps before terminating
     terminate_if_payload_below_z: float = 0.2 # ground crash
     terminate_if_drone_tilt_greater_than: float = math.radians(70.0)
@@ -220,6 +220,7 @@ class EnvConfig:
     # Post-init computations of dependent parameters
     def __post_init__(self):
         object.__setattr__(self, "dt", self.sim_dt * self.decimation)
+        object.__setattr__(self, "num_obs", 33 + 3 * len(self.ref_cfg.preview_s))
         # Latency is applied by holding the previous setpoint for the first sim steps of a policy step, so it caps at one policy step
         if round(self.dr_cfg.latency_s[1] / self.sim_dt) > self.decimation:
             raise ValueError(f"latency_s max {self.dr_cfg.latency_s[1]} s exceeds one policy step ({self.dt} s)")

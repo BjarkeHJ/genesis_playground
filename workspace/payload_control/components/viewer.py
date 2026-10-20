@@ -9,7 +9,7 @@ import torch
 # Viewer-only helpers. The viewer renders env 0, so everything here shows env 0 (rendered_envs_idx in the scene setup)
 
 class TargetMarker:
-    # Debug target for a command [x, y, z, yaw_ref]: sphere at the position, arrow along yaw_ref pointing outward from it
+    # Debug target [x, y, z, yaw_ref] (the current reference point): sphere at the position, arrow along yaw_ref
     def __init__(self, scene, radius=0.05, arrow_len=0.3):
         self.scene = scene
         self.radius = radius
@@ -31,12 +31,42 @@ class TargetMarker:
         # Move the existing nodes: clearing and re-drawing every step rebuilds meshes under the viewer lock (~40% of sim rate)
         self.scene.update_debug_objects(self.objs, (gu.trans_to_T(pos), gu.trans_R_to_T(arrow_pos, gu.z_up_to_R(heading))))
 
+class RoutePath:
+    # Debug polyline of a full reference route. Redrawn only when the route changes (a merged mesh: clearing and drawing
+    # it rebuilds geometry, too slow for every step)
+    def __init__(self, scene, radius=0.01, color=(0.0, 0.0, 0.0, 0.8)):
+        self.scene, self.radius, self.color = scene, radius, color
+        self.obj = None
+
+    def set(self, poss):
+        # poss (P, 3) points along the route; fewer than 2 (hover) just clears it
+        if self.obj is not None:
+            self.scene.clear_debug_object(self.obj)
+        poss = poss.cpu().numpy().astype(np.float32)
+        self.obj = self.scene.draw_debug_trajectory(poss, radius=self.radius, color=self.color) if len(poss) >= 2 else None
+
+class PreviewMarkers:
+    # Spheres at the reference preview points the policy observes, fading with horizon. Moved every step, never redrawn
+    def __init__(self, scene, n, radius=0.04):
+        self.scene, self.n, self.radius = scene, n, radius
+        self.objs = [] # drawn on the first update
+
+    def update(self, poss):
+        # poss (n, 3) preview points
+        poss = poss.cpu().numpy().astype(np.float32)
+        if not self.objs:
+            self.objs = [self.scene.draw_debug_sphere(pos=p.tolist(), radius=self.radius, color=(0.1, 0.4, 1.0, 0.9 - 0.6 * k / max(self.n - 1, 1)))
+                         for k, p in enumerate(poss)]
+            return
+        self.scene.update_debug_objects(self.objs, tuple(gu.trans_to_T(p) for p in poss))
+
 def attach_viewer_logs(env):
     # The viewer paces one sim_dt per update, but env.step() updates it once per decimation substeps: scale to stay real time
     env.scene.viewer.realtime_factor = env.decimation
     # Text overlay of env 0 state. Buffers are heading frame
     attach_sim_rate(env.scene)
     attach_log(env.scene, "|pos err| [m]", lambda: torch.norm(env.payload_pos_err, dim=1))
+    attach_log(env.scene, "|vel err| [m/s]", lambda: torch.norm(env.payload_vel_err, dim=1))
     attach_log(env.scene, "payload |v| [m/s]", lambda: torch.norm(env.payload_vel, dim=1))
     attach_log(env.scene, "payload yaw error [deg]", lambda: torch.rad2deg(env.payload_yaw_err))
     attach_log(env.scene, "reward", lambda: env.rew_buf, fmt="{:+.3f}")

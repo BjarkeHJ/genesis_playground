@@ -4,7 +4,7 @@ import torch
 class RewardsMixin:
     # Reward terms of PayloadControlEnv, computed from its state buffers. Each name in REWARD_TERMS maps to a method
     # _reward_<name> returning its weighted per-env reward. The names are the logged Episode_Reward/<name> tags
-    REWARD_TERMS = ("track", "progress", "damping", "swing_energy", "tilt", "yaw_error", "yaw_damping", "smooth_actions", "action_bound", "crash")
+    REWARD_TERMS = ("track", "vel_track", "swing_energy", "tilt", "yaw_error", "yaw_rate_track", "smooth_actions", "action_bound", "crash")
 
     def _init_rewards(self):
         self.reward_fns = {name: getattr(self, f"_reward_{name}") for name in self.REWARD_TERMS}
@@ -25,28 +25,19 @@ class RewardsMixin:
         self.episode_sums[:, envs_idx] = 0.0
 
     def _reward_track(self):
-        # Sharper gradient closer to the target but avoiding completely flat gradient further away
+        # Position error to the moving reference. Sharper gradient close to it but not flat further away
         dist = torch.norm(self.payload_pos_err, dim=1)
         track_rew = torch.exp(-dist / self.rew_cfg.sigma_track_rough)
         track_rew += torch.exp(-dist / self.rew_cfg.sigma_track_fine)
         track_rew *= self.rew_cfg.w_track
         return track_rew
 
-    def _reward_progress(self):
-        # NOTE: the prev_dist approach will not work once on trajectories because the target will move
-        # thus prev_dist and dist will not be calculated agains the same target position.
-        prev_dist_sq = torch.sum(torch.square(self.payload_prev_pos_err), dim=1)
-        dist_sq = torch.sum(torch.square(self.payload_pos_err), dim=1)
-        prog_rew = (prev_dist_sq - dist_sq) / self.dt * self.rew_cfg.w_progress
-        return prog_rew
-
-    def _reward_damping(self):
-        # Penalise payload speed only near the target: forces braking without slowing the approach
-        # NOTE: assumes a static setpoint. for trajectory tracking use (payload_vel - ref_vel) instead
-        dist = torch.norm(self.payload_pos_err, dim=1)
-        speed = torch.norm(self.payload_vel, dim=1)
-        damping_rew = speed * torch.exp(-dist / self.rew_cfg.sigma_damping) * self.rew_cfg.w_damping
-        return damping_rew
+    def _reward_vel_track(self):
+        # Velocity error to the reference, pseudo-Huber. Ungated: at the route end and in hover v_ref = 0, where this is
+        # the former damping term (penalise payload speed at the target)
+        d = self.rew_cfg.delta_vel_track
+        err = torch.norm(self.payload_vel_err, dim=1)
+        return (torch.sqrt(torch.square(err) + d**2) - d) * self.rew_cfg.w_vel_track
 
     def _reward_swing_energy(self):
         # Linear in amplitude so small residual swing near the target is still penalised
@@ -54,20 +45,19 @@ class RewardsMixin:
         return swing_energy_rew
 
     def _reward_yaw_error(self):
-        # Payload heading tracking, pseudo-Huber: linear outside delta so small errors are still worth correcting,
+        # Payload heading to the yaw reference, pseudo-Huber: linear outside delta so small errors are still worth correcting,
         # quadratic inside so the pull fades near zero instead of driving bang-bang yaw commands
         d = self.rew_cfg.delta_yaw
         yaw_rew = (torch.sqrt(torch.square(self.payload_yaw_err) + d**2) - d) * self.rew_cfg.w_yaw
         return yaw_rew
 
-    def _reward_yaw_damping(self):
-        # Yaw analogue of _reward_damping: penalise payload yaw rate only near the yaw target, so turning past it is
-        # worse than arriving slowly (braking) and residual twist swing at the target costs. Drone yaw is left free
-        d = self.rew_cfg.delta_yaw_damping
+    def _reward_yaw_rate_track(self):
+        # Payload yaw rate against the yaw-rate reference, pseudo-Huber, ungated: while the reference holds its heading
+        # (psi_dot_ref = 0) this damps yaw rate and residual twist swing. Drone yaw is left free
+        d = self.rew_cfg.delta_yaw_rate_track
         yaw_rate = self.payload_body_rates[:, 2] # payload tilt stays small, so body z ~ world z
-        gate = torch.exp(-torch.abs(self.payload_yaw_err) / self.rew_cfg.sigma_yaw_damping)
-        yaw_damping_rew = (torch.sqrt(torch.square(yaw_rate) + d**2) - d) * gate * self.rew_cfg.w_yaw_damping
-        return yaw_damping_rew
+        err = yaw_rate - self.yaw_rate_ref
+        return (torch.sqrt(torch.square(err) + d**2) - d) * self.rew_cfg.w_yaw_rate_track
 
     def _reward_tilt(self):
         # Payload attitude away from level: 1 - cos(tilt) ~ tilt²/2, so small tilts during manoeuvres are nearly free
@@ -86,14 +76,6 @@ class RewardsMixin:
         # Per-axis weights (w_smooth_actions: [thrust, roll, pitch, yawrate])
         action_rew = torch.sum(torch.square(self.actions - self.prev_actions) * self.w_smooth_actions, dim=1)
         return action_rew
-
-    def _reward_on_trajectory(self):
-        traj_rew = 0.0
-        # Some error between line-segment between trajectory setpoints.
-        # Distance from payload projected onto line (3D)
-        # Will it be any different than simply following the line from payload pos to target pos - i dont think so??
-
-        return traj_rew
 
     def _reward_crash(self):
         crash_rew = torch.where(self.crash_condition, self.rew_cfg.w_crash, 0.0)

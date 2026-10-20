@@ -41,8 +41,10 @@ class DomainRandomizer:
 
         self.ctrl.randomize(envs_idx, self.enabled)
 
-    def sample_initial_state(self, envs_idx):
-        # -> drone (pos, quat, lin vel), payload (pos, quat, lin vel) of envs_idx, with tethers slightly taut
+    def sample_initial_state(self, envs_idx, payload_yaw=None):
+        # -> drone (pos, quat, lin vel), payload (pos, quat, lin vel) of envs_idx, with tethers slightly taut. Payload at
+        # payload_init_pos (the env moves the state to its start point). payload_yaw (n, ): payload heading, the drone's
+        # within init_rel_yaw of it; None: uniform heading
         dr, n = self.cfg, len(envs_idx)
         lvl = 1.0 if self.enabled else 0.0 # scales every initial perturbation (0: nominal hover at rest)
         L = self.tether.rest_length[envs_idx]
@@ -56,8 +58,13 @@ class DomainRandomizer:
         drone_pos = payload_pos - r_hat * (L + attach_dz + 0.01).unsqueeze(-1) # slightly taut
 
         # Heading
-        yaw_d = gs_rand_float(-math.pi, math.pi, (n, ), self.device)
-        yaw_p = yaw_d + gs_rand_float(-dr.init_rel_yaw * lvl, dr.init_rel_yaw * lvl, (n, ), self.device)
+        rel_yaw = gs_rand_float(-dr.init_rel_yaw * lvl, dr.init_rel_yaw * lvl, (n, ), self.device)
+        if payload_yaw is None:
+            yaw_d = gs_rand_float(-math.pi, math.pi, (n, ), self.device)
+            yaw_p = yaw_d + rel_yaw
+        else:
+            yaw_p = payload_yaw
+            yaw_d = yaw_p - rel_yaw
 
         # Velocities
         v_d = dr.init_drone_vel * lvl * torch.randn((n, 3), device=self.device)

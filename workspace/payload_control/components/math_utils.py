@@ -6,9 +6,10 @@ import torch
 # ====== FRAMES / ROTATIONS ======
 
 def rotate_to_heading(v, yaw):
-    # World ENU vector -> heading frame: rotate by -yaw about world z. Gravity stays on z, no tilt involved
+    # World ENU vector -> heading frame: rotate by -yaw about world z. Gravity stays on z, no tilt involved.
+    # v (..., 3), yaw broadcastable to v[..., 0] (e.g. (N, ) for (N, 3), (N, 1) for (N, K, 3))
     c, s = torch.cos(yaw), torch.sin(yaw)
-    return torch.stack([c * v[:, 0] + s * v[:, 1], -s * v[:, 0] + c * v[:, 1], v[:, 2]], dim=-1)
+    return torch.stack([c * v[..., 0] + s * v[..., 1], -s * v[..., 0] + c * v[..., 1], v[..., 2]], dim=-1)
 
 def wrap_angle(a):
     # Wrap to (-pi, pi]

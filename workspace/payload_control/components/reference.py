@@ -25,13 +25,17 @@ BANK_DIR = os.path.join(LOG_DIR, "route_bank")
 BANK_FORMAT = 1 # bump when the stored fields change: part of the cache key
 HEADING_MIN_SPEED = 0.05 # heading0 is the reference velocity direction once its horizontal speed exceeds this [m/s]
 YAW_HYSTERESIS = 0.7 # the yaw follower engages above yaw_min_speed and releases below this fraction of it (no flicker)
+YAW_LOOKAHEAD_POINTS = 9 # samples of the yaw lookahead window
 
 # ====== BUILD (worker side) ======
 def _solve_entry(job):
     # (seed, keyword) -> one solved route as plain arrays. Runs in a worker process
     seed, keyword, route_cfg, sampler_cfg = job
     points, v_des = RouteSampler(sampler_cfg).sample(seed, keyword)
-    route = Route(points, v_des, route_cfg)
+    return _route_entry(Route(points, v_des, route_cfg), route_cfg, seed)
+
+def _route_entry(route, route_cfg, seed=-1):
+    # Route -> its solved trajectory as plain arrays, with what the bank stores per entry
     traj = MinSnapSolver(route_cfg).solve(route)
     # Initial heading: direction the reference starts moving in (on a short first leg it already curves into the next
     # turn, so the first leg's direction can be far off). Hover and purely vertical routes: 0
@@ -42,7 +46,7 @@ def _solve_entry(job):
         if moving.any():
             heading0 = float(np.arctan2(*v_h[np.argmax(moving)][::-1]))
     return {"coeffs": traj.coeffs, "durations": traj.durations, "duration": 0.0 if route.is_hover else traj.duration,
-            "end": route.points[-1], "heading0": heading0, "v_des": v_des, "seed": seed}
+            "end": route.points[-1], "heading0": heading0, "v_des": route.v_des, "seed": seed}
 
 class TrajectoryBank:
     # Solved routes as padded tensors: coeffs (B, S, 3, 8) in normalized segment time, durations (B, S), t_nodes
@@ -104,6 +108,15 @@ class TrajectoryBank:
         return path
 
     # ====== BUILD ======
+    @classmethod
+    def from_routes(cls, routes, keywords, keyword_ids=None, route_cfg=RouteConfig(), device="cpu"):
+        # In-memory bank of given Routes (evaluation, test routes), padded to their longest. keyword_ids index keywords
+        # per route; None: one keyword per route (its name)
+        entries = [_route_entry(r, route_cfg) for r in routes]
+        keyword_ids = list(range(len(routes))) if keyword_ids is None else keyword_ids
+        S = max(len(e["durations"]) for e in entries)
+        return cls(cls._pack(entries, keyword_ids, keywords, S), keywords, device)
+
     @staticmethod
     def build(bank_cfg, route_cfg, sampler_cfg, verbose=True):
         keywords = sampler_cfg.route_keywords
@@ -134,6 +147,18 @@ class TrajectoryBank:
                 n_redrawn += len(retry)
                 pending = retry
 
+        data = TrajectoryBank._pack(entries, kw_ids, keywords, S)
+        if verbose:
+            n_seg = data["num_segments"].float()
+            print(f"TrajectoryBank: built {B} routes in {time.perf_counter() - t_start:.0f} s ({n_redrawn} redrawn for > {S} "
+                  f"segments), segments median {n_seg.median():.0f} max {n_seg.max():.0f}, duration median "
+                  f"{data['duration'].median():.1f} s")
+        return data
+
+    @staticmethod
+    def _pack(entries, kw_ids, keywords, S):
+        # Solved entries -> padded tensors (see the class comment)
+        B = len(entries)
         coeffs = np.zeros((B, S, 3, N_COEF))
         durations = np.ones((B, S))
         for b, e in enumerate(entries):
@@ -151,11 +176,6 @@ class TrajectoryBank:
             "num_segments": torch.as_tensor([len(e["durations"]) for e in entries], dtype=torch.long),
             "keywords": tuple(keywords),
         }
-        if verbose:
-            n_seg = data["num_segments"].float()
-            print(f"TrajectoryBank: built {B} routes in {time.perf_counter() - t_start:.0f} s ({n_redrawn} redrawn for > {S} "
-                  f"segments), segments median {n_seg.median():.0f} max {n_seg.max():.0f}, duration median "
-                  f"{data['duration'].median():.1f} s")
         return data
 
 class ReferenceTrajectory:
@@ -163,10 +183,14 @@ class ReferenceTrajectory:
     # and a horizontal translation, and a reference clock τ advanced by α·dt per step (α ≡ 1 in phase 1, the hook for
     # time-scaling in phase 2). Past a route's end the reference holds its end point with zero derivatives.
     # Yaw reference psi_ref: not part of the position solve (yaw doesn't affect position feasibility). A first-order
-    # follower turns it towards the horizontal reference velocity direction, rate-limited to yaw_rate_max, and holds it
-    # below yaw_min_speed (stops, hover, route end). psi_ref is continuous; psi_dot_ref may step, which a yaw-rate
-    # command can follow
-    def __init__(self, bank: TrajectoryBank, num_envs, device, cfg: ReferenceConfig = ReferenceConfig()):
+    # follower turns it towards the direction of the lookahead velocity, rate-limited to yaw_rate_max, and holds it
+    # below yaw_min_speed (stops, hover, route end). The lookahead velocity is a weighted mean of the horizontal
+    # reference velocity over [τ, τ + yaw_lookahead_s]: averaging vectors (not angles) has no wrap issue, starts slow
+    # turns before the corner, and through a U-turn points along the cross leg as the opposite legs cancel. psi_ref is
+    # continuous; psi_dot_ref may step, which a yaw-rate command can follow.
+    # The per-step paths (step, eval over all envs) are launch-bound chains of tiny ops: with compile=True they are
+    # fused by torch.compile (fixed shapes). Subset evaluation at reset stays eager, its size changes every step
+    def __init__(self, bank: TrajectoryBank, num_envs, device, cfg: ReferenceConfig = ReferenceConfig(), compile=False):
         if cfg.yaw_mode not in ("velocity", "fixed"):
             raise ValueError(f"yaw_mode must be 'velocity' or 'fixed', got '{cfg.yaw_mode}'")
         self.bank, self.num_envs, self.device, self.cfg = bank, num_envs, torch.device(device), cfg
@@ -185,12 +209,22 @@ class ReferenceTrajectory:
         self.psi_ref = torch.zeros(num_envs, **f32) # yaw reference [rad], wrapped
         self.psi_dot_ref = torch.zeros(num_envs, **f32) # yaw-rate reference [rad/s]
         self.yaw_moving = torch.zeros(num_envs, device=self.device, dtype=torch.bool) # follower engaged (hysteresis state)
+        self.fixed_idx = None # evaluation: per-env bank entry instead of random routes, see fix_routes
+        # Lookahead window: offsets starting at 0 (so its first sample is the current reference) and normalized weights
+        n = YAW_LOOKAHEAD_POINTS if cfg.yaw_lookahead_s > 0.0 else 1
+        self.yaw_offsets = torch.linspace(0.0, cfg.yaw_lookahead_s, n, **f32)
+        w = torch.exp(-self.yaw_offsets / cfg.yaw_lookahead_decay)
+        self.yaw_weights = w / w.sum()
+        maybe_compile = torch.compile if compile else (lambda fn: fn)
+        self._eval_all_fn = maybe_compile(self._eval)
+        self._step_fn = maybe_compile(self._step)
 
     # ====== ASSIGNMENT ======
     def assign(self, env_ids, bank_idx, origin_xy, yaw, mirror=None, tau0=None, psi0=None):
         # Place bank entries bank_idx (M, ) for envs env_ids (M, ): route start at origin_xy (M, 2), rotated by yaw (M, ).
         # Yaw reference starts at psi0 if given, else at the reference velocity direction at tau0 if already moving
-        # (mid-route start), else at the direction the route starts moving in
+        # (mid-route start), else at the direction the route starts moving in. Returns the reference position and
+        # velocity at tau0 (M, 3) each, for placing the initial state
         self.idx[env_ids] = bank_idx
         self.origin[env_ids] = origin_xy
         self.cos_yaw[env_ids], self.sin_yaw[env_ids] = torch.cos(yaw), torch.sin(yaw)
@@ -200,21 +234,32 @@ class ReferenceTrajectory:
         self.t_nodes[env_ids] = self.bank.t_nodes[bank_idx]
         self.durations[env_ids] = self.bank.durations[bank_idx]
         self.duration[env_ids] = self.bank.duration[bank_idx]
-        self._reset_yaw(env_ids, psi0)
+        return self._reset_yaw(env_ids, psi0)
+
+    def fix_routes(self, bank_idx):
+        # Evaluation: from now on env i always gets bank entry bank_idx[i] (num_envs, ), unrotated, unmirrored, from its
+        # start, whenever the env assigns a route. None: random routes again
+        self.fixed_idx = None if bank_idx is None else torch.as_tensor(bank_idx, device=self.device, dtype=torch.long)
 
     def assign_random(self, env_ids, origin_xy, mirror=True, p_mid_route=0.0):
-        # Uniform bank entry, uniform yaw, random mirror; with probability p_mid_route a uniform start time on the route
+        # Uniform bank entry, uniform yaw, random mirror; with probability p_mid_route a uniform start time on the route.
+        # With fix_routes set: the fixed entry instead, unrotated and from its start
         M = len(env_ids)
         f32 = dict(device=self.device, dtype=torch.float32)
+        if self.fixed_idx is not None:
+            return self.assign(env_ids, self.fixed_idx[env_ids], origin_xy, torch.zeros(M, **f32))
         bank_idx = torch.randint(0, self.bank.size, (M,), device=self.device)
         yaw = (torch.rand(M, **f32) * 2.0 - 1.0) * torch.pi
         flip = torch.where(torch.rand(M, **f32) < 0.5, -1.0, 1.0) if mirror else None
         tau0 = torch.where(torch.rand(M, **f32) < p_mid_route, torch.rand(M, **f32) * self.bank.duration[bank_idx], 0.0)
-        self.assign(env_ids, bank_idx, origin_xy, yaw, flip, tau0)
+        return self.assign(env_ids, bank_idx, origin_xy, yaw, flip, tau0)
 
     # ====== CLOCK ======
     def step(self, dt):
         # Advance the reference clock, then the yaw follower at the new time
+        self._step_fn(dt)
+
+    def _step(self, dt):
         self.tau += self.alpha * dt
         self._update_yaw(dt)
 
@@ -230,9 +275,16 @@ class ReferenceTrajectory:
         return wrap_angle(torch.atan2(self.sin_yaw[ids], self.cos_yaw[ids]) + h)
 
     # ====== YAW REFERENCE ======
+    def _lookahead_velocity(self, vel):
+        # Weighted mean of the horizontal reference velocity over the lookahead window: vel (N, n, 3) at yaw_offsets -> (N, 2)
+        return torch.sum(vel[..., :2] * self.yaw_weights[:, None], dim=-2)
+
     def _reset_yaw(self, env_ids, psi0=None):
+        # -> reference position and velocity at the envs' current τ (M, 3), evaluated here anyway (first lookahead
+        # sample). The compiled all-env evaluation, then indexed, is cheaper than an eager one on the few reset envs
         cfg = self.cfg
-        v = self.eval([0.0], max_order=1, env_ids=env_ids)[1, :, 0, :2]
+        pos, vel = self._eval_all_fn(self.yaw_offsets, 1)[:, env_ids]
+        v = self._lookahead_velocity(vel)
         speed = v.norm(dim=-1)
         moving = speed > cfg.yaw_min_speed
         if psi0 is None:
@@ -240,24 +292,30 @@ class ReferenceTrajectory:
         self.psi_ref[env_ids] = wrap_angle(torch.as_tensor(psi0, device=self.device, dtype=torch.float32))
         self.psi_dot_ref[env_ids] = 0.0
         self.yaw_moving[env_ids] = moving
+        return pos[:, 0], vel[:, 0]
 
     def _update_yaw(self, dt):
         cfg = self.cfg
         if cfg.yaw_mode == "fixed":
             return
-        v = self.eval([0.0], max_order=1)[1, :, 0, :2]
+        v = self._lookahead_velocity(self._eval(self.yaw_offsets, 1)[1])
         speed = v.norm(dim=-1)
-        self.yaw_moving = torch.where(self.yaw_moving, speed > YAW_HYSTERESIS * cfg.yaw_min_speed, speed > cfg.yaw_min_speed)
+        # In place: compiled env stages hold on to these tensors
+        self.yaw_moving[:] = torch.where(self.yaw_moving, speed > YAW_HYSTERESIS * cfg.yaw_min_speed, speed > cfg.yaw_min_speed)
         target = torch.where(self.yaw_moving, torch.atan2(v[:, 1], v[:, 0]), self.psi_ref)
-        self.psi_dot_ref = (wrap_angle(target - self.psi_ref) / cfg.yaw_tau).clamp(-cfg.yaw_rate_max, cfg.yaw_rate_max)
-        self.psi_ref = wrap_angle(self.psi_ref + self.psi_dot_ref * dt)
+        self.psi_dot_ref[:] = (wrap_angle(target - self.psi_ref) / cfg.yaw_tau).clamp(-cfg.yaw_rate_max, cfg.yaw_rate_max)
+        self.psi_ref[:] = wrap_angle(self.psi_ref + self.psi_dot_ref * dt)
 
     # ====== EVALUATION ======
     def eval(self, offsets, max_order=2, env_ids=None):
         # Derivatives 0..max_order at τ + offsets (K, ) for every env (or env_ids), in the world frame
-        # -> (max_order+1, N, K, 3). Order 0 is position, 1 velocity, 2 acceleration
-        ids = slice(None) if env_ids is None else env_ids
+        # -> (max_order+1, N, K, 3). Order 0 is position, 1 velocity, 2 acceleration. Pass offsets as a device tensor on
+        # hot paths (a list costs a host->device copy per call)
         offsets = torch.as_tensor(offsets, device=self.device, dtype=torch.float32)
+        return self._eval_all_fn(offsets, max_order) if env_ids is None else self._eval(offsets, max_order, env_ids)
+
+    def _eval(self, offsets, max_order, env_ids=None):
+        ids = slice(None) if env_ids is None else env_ids
         t_nodes = self.t_nodes[ids]
         t = self.tau[ids][:, None] + offsets[None, :] # (N, K)
         dur = self.duration[ids][:, None]

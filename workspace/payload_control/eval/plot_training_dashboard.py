@@ -1,5 +1,6 @@
-"""Training dashboard from a run's TensorBoard logs: task outcome, success rate, penalties and return (top row), and
-optimisation health -- action std, adaptive learning rate, value loss, throughput (bottom row). Standalone: depends only on plot_utils."""
+"""Training dashboard from a run's TensorBoard logs: task outcome, tracking error, penalties and return (top row), and
+optimisation health -- action std, adaptive learning rate, value loss, throughput (bottom row). Standalone: depends only on plot_utils.
+Panels whose tags a run didn't log (older runs) are left out of the panel, not an error."""
 import glob
 import os
 import re
@@ -15,19 +16,27 @@ ppo = PPOConfig()
 LR_MIN, LR_MAX = 1e-5, 1e-2 # rsl_rl's adaptive-schedule clamps (algorithms/ppo.py)
 
 # Categorical slots from the shared validated set; a colour means one entity across the whole dashboard
-C_TRACK, C_CRASH, C_SUCCESS = "#2a78d6", "#e34948", "#4a3aa7"
+C_TRACK, C_CRASH, C_SUCCESS, C_COMPLETE = "#2a78d6", "#e34948", "#4a3aa7", "#1baf7a"
 C_SINGLE = INK2 # single-series panels: the title names the series, no hue needed
-PENALTIES = [ # (tag, label, colour, dash) -- dashes double-encode identity, three hues sit below 3:1 on the surface
-    ("damping", "damping near target", "#eb6834", "-"),
-    ("swing_energy", "swing energy", "#1baf7a", (0, (6, 3))),
-    ("yaw_error", "payload yaw err", "#eda100", (0, (2, 2))),
-    ("yaw_damping", "yaw damping near target", "#8a6d00", (0, (8, 2, 1, 2))),
-    ("tilt", "payload tilt", "#e87ba4", (0, (6, 2, 2, 2))),
-    ("vmax", "overspeed", "#008300", (0, (1, 3))),
-    ("smooth_actions", "action smoothness", "#4a3aa7", (0, (10, 3))),
-    ("action_bound", "action bound", "#52514e", (0, (3, 1, 1, 1))),
-    ("yaw", "payload yaw (older runs)", "#eda100", (0, (2, 2))), # tag before the yaw_error rename; absent in new runs
-]
+C_ERR = ("#2a78d6", "#4a3aa7", "#e34948") # mean, rms, max position error
+C_SWING = "#eda100"
+NOT_PENALTIES = ("track", "crash") # Episode_Reward terms shown in the outcome panel instead
+PENALTY_STYLE = { # tag -> (label, colour, dash); dashes double-encode identity, three hues sit below 3:1 on the surface
+    "vel_track": ("velocity tracking", "#eb6834", "-"),
+    "swing_energy": ("swing energy", "#1baf7a", (0, (6, 3))),
+    "yaw_error": ("payload yaw err", "#eda100", (0, (2, 2))),
+    "yaw_rate_track": ("yaw-rate tracking", "#8a6d00", (0, (8, 2, 1, 2))),
+    "tilt": ("payload tilt", "#e87ba4", (0, (6, 2, 2, 2))),
+    "smooth_actions": ("action smoothness", "#4a3aa7", (0, (10, 3))),
+    "action_bound": ("action bound", "#52514e", (0, (3, 1, 1, 1))),
+    # static-target runs (before route tracking)
+    "damping": ("damping near target", "#eb6834", "-"),
+    "yaw_damping": ("yaw damping near target", "#8a6d00", (0, (8, 2, 1, 2))),
+    "progress": ("progress", "#008300", (0, (1, 3))),
+    "vmax": ("overspeed", "#008300", (0, (1, 3))),
+    "yaw": ("payload yaw", "#eda100", (0, (2, 2))),
+}
+FALLBACK_STYLES = [("#2a78d6", (0, (1, 1))), ("#e34948", (0, (5, 1))), ("#4a3aa7", (0, (3, 3)))] # unknown terms, in order
 
 # ====== SHARED MARKERS ======
 def checkpoints(run):
@@ -44,39 +53,71 @@ def finish(ax, it, title, ylabel, xlabel=False):
 
 # ====== TOP ROW: WHAT IS IT LEARNING ======
 def plot_outcome(ax, S, ckpts):
-    # Logged reward terms are episode sums / episode_length_s, so the per-second maximum is (max reward per step) * steps per second
+    # Logged reward terms are episode sums / episode_length_s, so the per-second maximum is (max reward per step) * steps per
+    # second. Track: w_track * (exp(-d/σ_rough) + exp(-d/σ_fine)) peaks at 2 * w_track (older runs: one weight per exponential)
     it, track = require(S, "Episode_Reward/track")
-    _, crash = require(S, "Episode_Reward/crash")
     _, eplen = require(S, "Train/mean_episode_length")
-    series = [(100 * track / ((rw.w_track_rough + rw.w_track_fine) * STEPS_PER_S), C_TRACK, "-", "tracking (% of max)"),
-              (100 * crash * cfg.episode_length_s / rw.w_crash, C_CRASH, (0, (2, 2)), "episodes ending in crash"),
-              (100 * eplen / (cfg.episode_length_s * STEPS_PER_S), C_SINGLE, (0, (1, 2)), "episode length (% of max)")]
-    for y, col, ls, name in series:
-        plot_raw_ema(ax, it, y, col, name + "  ({final:.0f}%)", ls=ls)
+    track_max = 2.0 * rw.w_track if hasattr(rw, "w_track") else rw.w_track_rough + rw.w_track_fine
+    series = [(it, 100 * track / (track_max * STEPS_PER_S), C_TRACK, "-", "tracking (% of max)")]
+    if "Task/crash_rate" in S:
+        series.append((*S["Task/crash_rate"][:1], 100 * S["Task/crash_rate"][1], C_CRASH, (0, (2, 2)), "episodes ending in crash"))
+    elif "Episode_Reward/crash" in S: # older runs: from the crash penalty
+        series.append((it, 100 * S["Episode_Reward/crash"][1] * cfg.episode_length_s / rw.w_crash, C_CRASH, (0, (2, 2)), "episodes ending in crash"))
+    if "Task/success_rate" in S: # sparse (one point per window)
+        series.append((*S["Task/success_rate"][:1], 100 * S["Task/success_rate"][1], C_SUCCESS, (0, (6, 2)), "success rate"))
+    if "Task/route_completion" in S:
+        series.append((*S["Task/route_completion"][:1], 100 * S["Task/route_completion"][1], C_COMPLETE, (0, (4, 1, 1, 1)), "route completion"))
+    series.append((it, 100 * eplen / (cfg.episode_length_s * STEPS_PER_S), C_SINGLE, (0, (1, 2)), "episode length (% of max)"))
+    for x, y, col, ls, name in series:
+        sparse = name == "success rate" # one point per window: dots and a faster EMA
+        plot_raw_ema(ax, x, y, col, name + "  ({final:.0f}%)", ls=ls, dots=sparse, alpha=0.3 if sparse else 0.1)
     if len(ckpts):
         tr = blended_transform_factory(ax.transData, ax.transAxes)
         ax.plot(ckpts, np.zeros_like(ckpts), transform=tr, lw=0, marker="^", ms=8, color=INK, clip_on=False,
                 label=f"checkpoint saved ({len(ckpts)})")
     ax.set_ylim(0, 103)
     finish(ax, it, "Task outcome", "%")
-    ax.legend(loc="upper right", bbox_to_anchor=(1.0, 0.94), fontsize=9)
+    ax.legend(loc="center right", bbox_to_anchor=(1.0, 0.32), fontsize=9)
 
-def plot_success(ax, S):
-    if "Task/success_rate" not in S:
-        ax.text(0.5, 0.5, "no success rate logged", ha="center", va="center", color=MUTED, transform=ax.transAxes)
-        ax.set_title("Success rate", fontsize=12.5)
+def plot_tracking_error(ax, S):
+    # Task/*: means over the episodes finished in each iteration (env._log_episode_tracking), error to the moving reference
+    tags = [("Task/mean_pos_err", "mean", "-"), ("Task/rms_pos_err", "RMS", (0, (6, 2))), ("Task/max_pos_err", "max", (0, (2, 2)))]
+    if not any(t in S for t, _, _ in tags):
+        ax.text(0.5, 0.5, "no Task/ tracking metrics logged\n(static-target run)", ha="center", va="center", color=MUTED,
+                transform=ax.transAxes)
+        ax.set_title("Tracking error", fontsize=12.5)
         return
-    it, sr = S["Task/success_rate"] # sparse (one point per window): dots and a faster EMA
-    plot_raw_ema(ax, it, 100 * sr, C_SUCCESS, "success rate  ({final:.0f}%)", alpha=0.3, dots=True)
-    ax.set_ylim(0, 103)
-    finish(ax, it, "Success rate", "% of episodes per window")
-    ax.legend(loc="lower right", fontsize=9)
+    it = None
+    for (tag, name, ls), col in zip(tags, C_ERR):
+        if tag in S:
+            it, y = S[tag]
+            plot_raw_ema(ax, it, y, col, name + "  ({final:.3f} m)", ls=ls)
+    ax.set_yscale("log") # early errors are metres, a trained policy's centimetres
+    finish(ax, it, "Tracking error to the reference", "position error [m] (log)")
+    handles, labels = ax.get_legend_handles_labels()
+    if "Task/mean_swing_deg" in S:
+        ax2 = ax.twinx()
+        it_s, sw = S["Task/mean_swing_deg"]
+        plot_raw_ema(ax2, it_s, sw, C_SWING, "mean swing  ({final:.1f}°)", ls=(0, (1, 2)))
+        ax2.set_ylim(0, np.percentile(sw, 95) * 1.1)
+        ax2.set_ylabel("mean swing amplitude [deg]", color=C_SWING)
+        ax2.grid(False)
+        h2, l2 = ax2.get_legend_handles_labels()
+        handles, labels = handles + h2, labels + l2
+    ax.legend(handles, labels, loc="upper right", fontsize=9)
 
 def plot_penalties(ax, S):
-    lo, it = 0.0, None
-    for tag, name, col, ls in PENALTIES:
-        if f"Episode_Reward/{tag}" not in S:
+    # Every logged Episode_Reward term except track and crash, known terms in their fixed style
+    lo, it, k = 0.0, None, 0
+    tags = sorted(t.split("/", 1)[1] for t in S if t.startswith("Episode_Reward/"))
+    for tag in tags:
+        if tag in NOT_PENALTIES:
             continue
+        if tag in PENALTY_STYLE:
+            name, col, ls = PENALTY_STYLE[tag]
+        else:
+            (col, ls), name = FALLBACK_STYLES[k % len(FALLBACK_STYLES)], tag
+            k += 1
         it, y = S[f"Episode_Reward/{tag}"]
         plot_raw_ema(ax, it, y, col, name + "  ({final:.2f})", ls=ls)
         lo = min(lo, np.percentile(y, 2)) # ignore the first-iteration spikes when scaling
@@ -142,9 +183,9 @@ def main():
 
     fig, axes = plt.subplots(2, 4, figsize=(22, 9.5), sharex=True)
     fig.subplots_adjust(left=0.045, right=0.99, top=0.87, bottom=0.1, wspace=0.28, hspace=0.38)
-    (a_out, a_succ, a_pen, a_ret), (a_std, a_lr, a_val, a_fps) = axes
+    (a_out, a_err, a_pen, a_ret), (a_std, a_lr, a_val, a_fps) = axes
     plot_outcome(a_out, S, checkpoints(args.run))
-    plot_success(a_succ, S)
+    plot_tracking_error(a_err, S)
     plot_penalties(a_pen, S)
     plot_return(a_ret, S)
     plot_std(a_std, S)
