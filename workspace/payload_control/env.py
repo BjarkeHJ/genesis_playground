@@ -201,6 +201,7 @@ class PayloadControlEnv(RewardsMixin):
 
         # Observation state buffers
         self.payload_pos_err = zeros(3) # Drone heading frame (RTK)
+        self.payload_prev_pos_err = zeros(3)
         self.payload_yaw_err = zeros() # wrap(yaw_ref - payload yaw)
         self.payload_vel = zeros(3) # Drone heading frame (RTK)
         self.payload_proj_g = zeros(3) # Gravity in payload body axes
@@ -342,6 +343,7 @@ class PayloadControlEnv(RewardsMixin):
         # Payload tracking and attitude
         payload_yaw = quat_yaw(payload_quat)
         self.payload_pos[:] = payload_pos
+        self.payload_prev_pos_err[:] = self.payload_pos_err # last update's error: step()'s reward runs after its first update
         self.payload_pos_err[:] = rotate_to_heading(self.commands[:, :3] - payload_pos, yaw)
         self.payload_yaw_err[:] = wrap_angle(self.commands[:, 3] - payload_yaw) # can wrap: observed as sin/cos
         self.payload_vel[:] = rotate_to_heading(payload_vel, yaw)
@@ -432,7 +434,8 @@ class PayloadControlEnv(RewardsMixin):
                 # Task (heading frame)
                 torch.clamp(self.payload_pos_err * self.pos_obs_scale, -1.0, 1.0), # payload pos err, dim=3
                 torch.clamp(self.payload_vel * self.vel_obs_scale, -1.0, 1.0), # payload vel, dim=3
-                # Payload
+
+                # Payload dim=13
                 self.payload_proj_g, # gravity in payload body axes, dim=3
                 torch.clamp(self.payload_body_rates * s.pl_body_rates, -1.0, 1.0), # payload body rates, dim=3
                 torch.clamp(self.payload_swing_angles * s.pl_swing_angles, -1.0, 1.0), # swing angles (heading frame), dim=2
@@ -440,6 +443,7 @@ class PayloadControlEnv(RewardsMixin):
                 torch.clamp(self.drone_payload_rel_yaw.unsqueeze(-1) * s.rel_yaw, -1.0, 1.0), # drone-payload relative yaw, dim=1
                 torch.sin(self.payload_yaw_err).unsqueeze(-1), # payload yaw err, dim=1
                 torch.cos(self.payload_yaw_err).unsqueeze(-1), # -- dim=1
+                
                 # Drone
                 self.drone_proj_g, # gravity in drone body axes, dim=3
                 torch.clamp(self.drone_body_rates * s.drone_body_rates, -1.0, 1.0), # drone body rates, dim=3

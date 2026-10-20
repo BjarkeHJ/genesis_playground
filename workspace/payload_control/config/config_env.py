@@ -86,15 +86,46 @@ class CommandConfig:
     pos_z_range: float = 2.0
     yaw_range: float = math.radians(90.0) # yaw_ref around initial payload heading
 
+@dataclass(frozen=True)
+class RouteSamplerConfig:
+    route_keywords: tuple[str, ...] = ("random", "survey", "loop", "zigzag", "stop")
+    num_points_min: int = 5
+    num_points_max: int = 20
+    turn_max: float = math.radians(90.0)
+    alt_min: float = 1.0
+    alt_max: float = 3.0
+    seg_length_min: float = 1.0
+    seg_length_max: float = 10.0
+    v_des_min: float = 1.0
+    v_des_max: float = 2.0
+    
+    # probabilities
+    p_straight: float = 0.3
+    p_climb: float = 0.2
+    
+# ====== ROUTE CONFIG ======
+@dataclass(frozen=True)
+class RouteConfig:
+    # Route -> payload reference. Only the mission spec and the system envelope live here; the generator's internal
+    # shaping constants are in components/route.py and components/trajectory.py and are not meant to be tuned
+    # Mission spec
+    corridor: float = 0.5 # max deviation of a rounded corner from its waypoint [m]
+    min_altitude: float = 1.0 # payload [m]
+
+    # System envelope: limits on the payload reference after time-scaling (all durations stretched by one factor k).
+    # Corner and ramp accelerations used for planning are fixed fractions of a_max
+    a_max: float = 2.0 # [m/s²]
+    j_max: float = 3.0 # [m/s³]
+
 # ======= Observation Scales =======
 @dataclass(frozen=True)
 class ObservationScales:
     px: float = 1.0 / 3.0
     py: float = 1.0 / 3.0
     pz: float = 1.0 / 3.0
-    vx: float = 1.0 / 6.0 # v_max maps to 0.5 so overspeed stays visible
-    vy: float = 1.0 / 6.0
-    vz: float = 1.0 / 6.0
+    vx: float = 1.0 / 10.0
+    vy: float = 1.0 / 10.0
+    vz: float = 1.0 / 10.0
     pl_body_rates: float = 1.0 / math.pi # size?
     pl_swing_angles: float = 1.0 / math.radians(60.0) # = 1 / terminate_if_swingangle_greater_than
     pl_swing_angles_rates: float = 1.0 / 1.0 # measure?
@@ -106,25 +137,26 @@ class ObservationScales:
 class RewardConfig:
     sigma_track_rough: float = 3.0
     sigma_track_fine: float = 0.3
-    w_track_rough: float = 1.0
-    w_track_fine: float = 1.5
+    w_track: float = 1.0
 
-    v_max: float = 3.0 # payload speed limit [m/s]
-    w_vmax: float = -1.0 # per (m/s)² above v_max
-
+    w_progress: float = 0.1 # per m²/s of closing squared distance (2 m/s at 3 m ~ 1.2 per step)
+    
     sigma_damping: float = 0.5 # gate on payload speed penalty near the target [m]
     w_damping: float = -0.75 # per m/s of payload speed at the target
-    w_swing_energy: float = -1.0 # per rad of equivalent swing amplitude
-    
-    delta_yaw: float = 0.1 # pseudo-Huber knee on payload yaw err: quadratic inside, linear outside [rad]
+        
+    delta_yaw: float = 0.2 # pseudo-Huber knee on payload yaw err: quadratic inside, linear outside [rad]
     w_yaw: float = -0.3 # per rad of payload yaw err (outside the knee)
+
     sigma_yaw_damping: float = 0.3 # gate on payload yaw rate penalty near the yaw target [rad]
     delta_yaw_damping: float = 0.2 # pseudo-Huber knee on payload yaw rate [rad/s]
     w_yaw_damping: float = -0.3 # per rad/s of payload yaw rate at the yaw target (outside the knee)
-
+    
+    w_swing_energy: float = -1.0 # per rad of equivalent swing amplitude
     w_tilt: float = -1.0 # per (1 - cos(payload tilt))
+
     w_smooth_actions: tuple[float, float, float, float] = (-0.1, -0.1, -0.1, -0.1) # per Δa² [thrust, roll, pitch, yawrate]
-    w_action_bound: float = -1.0 # per (pre-clip |a| - clip_actions)², summed over actions
+    w_action_bound: float = -5.0 # per (pre-clip |a| - clip_actions)², summed over actions
+
     w_crash: float = -10.0
 
 # ====== ENVIRONMENT CONFIG ======

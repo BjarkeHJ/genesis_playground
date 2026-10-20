@@ -4,7 +4,7 @@ import torch
 class RewardsMixin:
     # Reward terms of PayloadControlEnv, computed from its state buffers. Each name in REWARD_TERMS maps to a method
     # _reward_<name> returning its weighted per-env reward. The names are the logged Episode_Reward/<name> tags
-    REWARD_TERMS = ("track", "vmax", "damping", "swing_energy", "tilt", "yaw_error", "yaw_damping", "smooth_actions", "action_bound", "crash")
+    REWARD_TERMS = ("track", "progress", "damping", "swing_energy", "tilt", "yaw_error", "yaw_damping", "smooth_actions", "action_bound", "crash")
 
     def _init_rewards(self):
         self.reward_fns = {name: getattr(self, f"_reward_{name}") for name in self.REWARD_TERMS}
@@ -27,14 +27,18 @@ class RewardsMixin:
     def _reward_track(self):
         # Sharper gradient closer to the target but avoiding completely flat gradient further away
         dist = torch.norm(self.payload_pos_err, dim=1)
-        track_rew = torch.exp(-dist / self.rew_cfg.sigma_track_rough) * self.rew_cfg.w_track_rough
-        track_rew += torch.exp(-dist / self.rew_cfg.sigma_track_fine) * self.rew_cfg.w_track_fine
+        track_rew = torch.exp(-dist / self.rew_cfg.sigma_track_rough)
+        track_rew += torch.exp(-dist / self.rew_cfg.sigma_track_fine)
+        track_rew *= self.rew_cfg.w_track
         return track_rew
 
-    def _reward_vmax(self):
-        overspeed = torch.clamp(torch.norm(self.payload_vel, dim=1) - self.rew_cfg.v_max, min=0.0)
-        vmax_rew = torch.square(overspeed) * self.rew_cfg.w_vmax
-        return vmax_rew
+    def _reward_progress(self):
+        # NOTE: the prev_dist approach will not work once on trajectories because the target will move
+        # thus prev_dist and dist will not be calculated agains the same target position.
+        prev_dist_sq = torch.sum(torch.square(self.payload_prev_pos_err), dim=1)
+        dist_sq = torch.sum(torch.square(self.payload_pos_err), dim=1)
+        prog_rew = (prev_dist_sq - dist_sq) / self.dt * self.rew_cfg.w_progress
+        return prog_rew
 
     def _reward_damping(self):
         # Penalise payload speed only near the target: forces braking without slowing the approach
