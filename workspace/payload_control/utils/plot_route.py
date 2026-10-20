@@ -85,7 +85,7 @@ def plot_route(ax, kw, seed, route, traj):
             f"{len(W)} pts · {route.length:.0f} m · z {z.min():.1f}–{z.max():.1f} m\n"
             f"{traj.num_segments} seg · {traj.duration:.0f} s · k {traj.k_scale:.2f} · "
             f"mean v/v_des {route.length / max(traj.duration, 1e-9) / v_ref:.2f}")
-    ax.text(0.0, -0.2, info, transform=ax.transAxes, fontsize=7.5, color=MUTED)
+    # ax.text(0.0, -0.2, info, transform=ax.transAxes, fontsize=7.5, color=MUTED)
     ax.set_xlabel("E [m]")
     ax.set_ylabel("N [m]")
     if route.is_hover: # a single point: fixed window instead of autoscaling to nothing

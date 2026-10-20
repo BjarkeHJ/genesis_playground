@@ -117,6 +117,26 @@ class RouteConfig:
     a_max: float = 2.0 # [m/s²]
     j_max: float = 3.0 # [m/s³]
 
+# ====== REFERENCE CONFIG ======
+@dataclass(frozen=True)
+class ReferenceConfig:
+    # Online per-env reference on top of the bank (not part of the bank's cache key). Yaw is not optimized with the
+    # position: a rate-limited follower turns the yaw reference towards the reference velocity direction
+    yaw_mode: str = "velocity" # "velocity": follow the reference velocity direction | "fixed": hold the initial heading
+    yaw_tau: float = 0.75 # follower time constant [s]: larger follows corners more loosely
+    yaw_rate_max: float = math.radians(30.0) # yaw-rate reference limit, below SystemConfig.max_yaw_rate (45°/s) to leave room for corrections
+    yaw_min_speed: float = 0.3 # below this horizontal reference speed the yaw reference holds (stops, hover) [m/s]
+
+# ====== TRAJECTORY BANK CONFIG ======
+@dataclass(frozen=True)
+class TrajectoryBankConfig:
+    # Routes sampled with RouteSamplerConfig and solved with RouteConfig once, cached under logs/route_bank
+    size: int = 20_000
+    max_segments: int = 128 # padded length; longer routes are redrawn
+    keyword_weights: tuple[float, ...] = (0.2, 0.2, 0.2, 0.2, 0.2) # per RouteSamplerConfig.route_keywords
+    seed: int = 0
+    num_workers: int = 8 # processes for the build (not part of the cache key)
+
 # ======= Observation Scales =======
 @dataclass(frozen=True)
 class ObservationScales:

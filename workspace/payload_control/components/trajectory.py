@@ -25,10 +25,10 @@ SNAP = 4
 A_ALLOC_FRAC = 0.5 # planned acceleration on straights, fraction of a_max: min-snap peaks above the trapezoid it follows
 A_REST_FRAC = 0.25 # ...for ramps from and to rest (route ends, stop nodes). Snap is free there and jumps from 0 at hover,
                    # a step in drone tilt via the cable (≈ L/g · snap); snap scales ~ a³
-MIN_STRAIGHT_SEG_TIME = 1.0 # straight nodes at least this far apart in time and from the straight's ends (room to blend out of a fillet) [s]
-MIN_REST_SEG_TIME = 2.0 # ...and pieces into or out of rest at least this long: a short piece out of v = a = j = 0 needs a large snap [s]
-MAX_STRAIGHT_SEG_TIME = 2.0 # longer straight pieces are split: long segments let min-snap bend them at no cost [s]
 MIN_SEG_TIME = 0.2 # floor on any segment duration [s]
+MIN_STRAIGHT_SEG_TIME = 0.5 # straight nodes at least this far apart in time and from the straight's ends (room to blend out of a fillet) [s]
+MAX_STRAIGHT_SEG_TIME = 1.0 # longer straight pieces are split: long segments let min-snap bend them at no cost [s]
+MIN_REST_SEG_TIME = 2.0 # ...and pieces into or out of rest at least this long: a short piece out of v = a = j = 0 needs a large snap [s]
 SCALE_CHECK_DT = 0.01 # sampling step of the peak search for time-scaling [s]
 
 def _derivative_factors(max_order=ORDER):
