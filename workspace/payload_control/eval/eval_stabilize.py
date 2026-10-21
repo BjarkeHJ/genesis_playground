@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import sys
 
@@ -11,64 +12,68 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from config.run_config import use_run_configs, plots_dir, resolve_ckpt, dataclass_to_dict
 use_run_configs() # logs/<--run>/config in place of the current configs -- must precede env/utils imports
 
-from env import *
-from components.math_utils import gs_rand_float
-from config.config_training import TrainConfig
-from config.config_env import EnvConfig
+from system_model.utils.qc_attitude_control import quat_yaw # noqa: E402
+from env import PayloadControlEnv # noqa: E402
+from components.math_utils import gs_rand_float, wrap_angle # noqa: E402
+from components.reference import TrajectoryBank # noqa: E402
+from components.route import Route # noqa: E402
+from config.config_env import EnvConfig, EPS # noqa: E402
+from config.config_training import TrainConfig # noqa: E402
+from eval.routes import TEST_ROUTES # noqa: E402
+from eval.route_metrics import payload_roll_pitch, cone_angle # noqa: E402
 
-# Disturbance-rejection eval: the target is the nominal hover point (payload hanging straight below the drone at spawn),
-# and every episode starts with the system knocked out of equilibrium:
-#   - payload swung out by a random angle/azimuth on a sphere of tether length around the drone
-#   - random lateral payload velocity kick
-#   - random drone body-rate kick
-#   - optional payload yaw-reference step (--yaw_deg)
+# Disturbance-rejection eval: every env flies a hover route (a single-point reference held for the whole episode, the
+# payload starts at rest hanging below the drone on it), and every episode starts with the system knocked out of equilibrium:
+#   - payload swung out by an angle/azimuth on a sphere of tether length around the drone
+#   - lateral payload velocity kick
+#   - drone angular velocity kick
+#   - payload yaw-reference step
 # The policy only has to bring the payload back to rest at the target.
+# Default: one episode with exactly the disturbance of the arguments (azimuths in the world frame, the payload faces +x
+# at reset on the nominal system). --random: magnitudes in [0.5, 1] x value, random directions, yaw step in +-value,
+# for statistics over many episodes (--num_envs, --num_episodes)
 
 def sample_disturbance(e, idx, args):
     k, dev = len(idx), e.device
-    L = e.sys_cfg.rest_length
+    L = e.tether.rest_length[idx].unsqueeze(-1)
+    mag = lambda v: v * (gs_rand_float(0.5, 1.0, (k, ), dev) if args.random else torch.ones(k, device=dev))
+    azimuth = lambda deg: gs_rand_float(-math.pi, math.pi, (k, ), dev) if args.random else torch.full((k, ), math.radians(deg), device=dev)
 
-    # Swing: angle in [0.5, 1] * max so every episode is a real disturbance, uniform azimuth
-    theta = math.radians(args.swing_deg) * gs_rand_float(0.5, 1.0, (k, ), dev)
-    phi = gs_rand_float(-math.pi, math.pi, (k, ), dev)
+    # Swing (random: angle in [0.5, 1] * max so every episode is a real disturbance)
+    theta = mag(math.radians(args.swing_deg))
+    phi = azimuth(args.swing_az_deg)
     drone_pos = e.drone.get_pos(idx)
     payload_pos = drone_pos + L * torch.stack([torch.sin(theta) * torch.cos(phi), torch.sin(theta) * torch.sin(phi), -torch.cos(theta)], dim=-1)
     e.payload.set_pos(payload_pos, zero_velocity=True, envs_idx=idx)
 
     # Payload lateral velocity kick
-    psi = gs_rand_float(-math.pi, math.pi, (k, ), dev)
-    v_mag = args.payload_vel * gs_rand_float(0.5, 1.0, (k, ), dev)
+    psi = azimuth(args.payload_vel_az_deg)
+    v_mag = mag(args.payload_vel)
     payload_vel = torch.stack([v_mag * torch.cos(psi), v_mag * torch.sin(psi), torch.zeros_like(v_mag)], dim=-1)
     e.payload.set_dofs_velocity(payload_vel, dofs_idx_local=[0, 1, 2], envs_idx=idx)
 
-    # Drone angular velocity kick (random direction)
-    w_dir = torch.randn((k, 3), device=dev)
+    # Drone angular velocity kick about --drone_rate_axis (random: random direction)
+    w_dir = torch.randn((k, 3), device=dev) if args.random else torch.tensor(args.drone_rate_axis, device=dev, dtype=torch.float32).expand(k, 3)
     w_dir = w_dir / torch.clamp(torch.norm(w_dir, dim=-1, keepdim=True), min=EPS)
-    drone_ang = w_dir * args.drone_rate * gs_rand_float(0.5, 1.0, (k, 1), dev)
+    drone_ang = w_dir * mag(args.drone_rate).unsqueeze(-1)
     e.drone.set_dofs_velocity(drone_ang, dofs_idx_local=[3, 4, 5], envs_idx=idx)
 
-    # Target = undisturbed hover point, yaw_ref = reset payload heading (+ optional step)
-    yaw_step = math.radians(args.yaw_deg) * gs_rand_float(-1.0, 1.0, (k, ), dev)
-    e.commands[idx, :3] = e.payload_init_pos
-    e.commands[idx, 3] = wrap_angle(quat_yaw(e.payload.get_quat(idx)) + yaw_step)
-    e._draw_target(idx)
-
-def payload_roll_pitch(e):
-    # ZYX roll/pitch from gravity in payload body axes g_b = [sin(p), -sin(r)cos(p), -cos(r)cos(p)] (yaw-independent)
-    g = e.payload_proj_g
-    return torch.stack([torch.atan2(-g[:, 1], -g[:, 2]), torch.asin(torch.clamp(g[:, 0], -1.0, 1.0))], dim=-1)
+    # Target = the hover route's point (held by the reference), yaw_ref = reset payload heading + step. The hover
+    # reference never moves, so the yaw follower holds psi_ref from here on
+    yaw_step = math.radians(args.yaw_deg) * (gs_rand_float(-1.0, 1.0, (k, ), dev) if args.random else torch.ones(k, device=dev))
+    e.ref.psi_ref[idx] = wrap_angle(quat_yaw(e.payload.get_quat(idx)) + yaw_step)
+    e.ref.psi_dot_ref[idx] = 0.0
 
 def refresh_obs(e):
-    # Recompute the state-derived buffers from the (disturbed) sim state without counting a step
+    # Recompute the state-derived buffers and observations from the (disturbed) sim state without stepping
     e._update_buffers()
-    e.episode_length_buf -= 1
     e._update_observations()
+    e._draw_reference()
     return e.get_observations()
 
 def swing_cone(e):
     # Total swing angle from vertical of the drone->payload vector
-    r = e.payload.get_pos() - e.drone.get_pos()
-    return torch.atan2(torch.norm(r[:, :2], dim=-1), -r[:, 2])
+    return cone_angle(e.payload_swing_angles)
 
 def pm_lines(ax, val, color, label):
     # Dotted +-val threshold pair with a single legend entry
@@ -208,23 +213,31 @@ def main():
     parser.add_argument("--run", type=str, default="dev_test", help="Run name under payload_control/logs")
     parser.add_argument("--ckpt", type=str, default=None, help="Iteration number or path to model_*.pt (default: latest)")
     parser.add_argument("--num_envs", type=int, default=1)
-    parser.add_argument("--num_episodes", type=int, default=5, help="Stop after this many finished episodes")
+    parser.add_argument("--num_episodes", type=int, default=1, help="Stop after this many finished episodes")
     parser.add_argument("--headless", action="store_true", help="Disable the viewer (use with many envs for stats)")
     parser.add_argument("--no_compile", action="store_true", help="Skip torch.compile of the per-sim-step code (faster startup, ~3x slower stepping)")
     parser.add_argument("--duration", type=float, default=8.0, help="Episode length [s]")
     parser.add_argument("--dr", action="store_true", help="Full domain randomization ranges (default: nominal system)")
     parser.add_argument("--seed", type=int, default=0, help="Seed of the disturbances, reset states (and system params with --dr)")
-    # Disturbance magnitudes (each sampled in [0.5, 1] x value)
-    parser.add_argument("--swing_deg", type=float, default=45.0, help="Initial payload swing angle [deg]")
-    parser.add_argument("--payload_vel", type=float, default=1.0, help="Initial lateral payload velocity [m/s]")
-    parser.add_argument("--drone_rate", type=float, default=2.0, help="Initial drone angular velocity [rad/s]")
-    parser.add_argument("--yaw_deg", type=float, default=0.0, help="Payload yaw reference step, uniform in +-value [deg]")
+    parser.add_argument("--alt", type=float, default=float(TEST_ROUTES["hover"][0, 2]), help="Payload hover altitude [m]")
+    # Disturbance: exactly these values, or with --random magnitudes in [0.5, 1] x value and random directions
+    parser.add_argument("--random", action="store_true", help="Sample the disturbance per episode instead of the fixed values")
+    parser.add_argument("--swing_deg", type=float, default=45.0, help="Initial payload swing angle from vertical [deg]")
+    parser.add_argument("--swing_az_deg", type=float, default=0.0, help="Swing direction, world azimuth from +x [deg]")
+    parser.add_argument("--payload_vel", type=float, default=0.5, help="Initial lateral payload velocity [m/s]")
+    parser.add_argument("--payload_vel_az_deg", type=float, default=90.0, help="Payload velocity direction, world azimuth from +x [deg]")
+    parser.add_argument("--drone_rate", type=float, default=1.0, help="Initial drone angular velocity [rad/s]")
+    parser.add_argument("--drone_rate_axis", type=float, nargs=3, default=(1.0, 0.0, 0.0), help="Drone angular velocity axis (world, normalized)")
+    parser.add_argument("--yaw_deg", type=float, default=0.0, help="Payload yaw reference step (--random: uniform in +-value) [deg]")
     # Settled = all of these hold from some time until the end of the episode
     parser.add_argument("--settle_pos", type=float, default=0.25, help="Settled position error [m]")
     parser.add_argument("--settle_swing_deg", type=float, default=5.0, help="Settled swing cone angle [deg]")
     parser.add_argument("--settle_vel", type=float, default=0.2, help="Settled payload speed [m/s]")
     parser.add_argument("--settle_yaw_deg", type=float, default=10.0, help="Settled payload yaw error [deg]")
+    # Viz
     parser.add_argument("--no_plot", action="store_true", help="Skip saving the env-0 plot")
+    parser.add_argument("--record", action="store_true", help="Save a video of env 0 next to the plots (works with --headless)")
+    parser.add_argument("--follow", action="store_true", help="Viewer/video camera chases env 0's drone from above and behind")
     args = parser.parse_args()
 
     ckpt_path = resolve_ckpt(args.run, args.ckpt)
@@ -235,7 +248,12 @@ def main():
     # Same TrainConfig as train.py -- actor/critic architecture must match the checkpoint's saved weights
     train_cfg_dict = dataclass_to_dict(TrainConfig(run_name=args.run))
     env_cfg = EnvConfig(num_envs=args.num_envs, episode_length_s=args.duration, torch_compile=not args.no_compile)
-    e = PayloadControlEnv(env_cfg=env_cfg, show_viewer=not args.headless, device="cuda")
+
+    # One-entry bank holding the hover route; every env gets it on every reset (unrotated, from its start)
+    bank = TrajectoryBank.from_routes([Route.hover((0.0, 0.0, args.alt), env_cfg.route_cfg)], ("hover", ), route_cfg=env_cfg.route_cfg, device="cuda")
+    e = PayloadControlEnv(env_cfg=env_cfg, show_viewer=not args.headless, device="cuda", bank=bank, record=args.record, follow=args.follow)
+    e.ref.fix_routes(torch.zeros(e.num_envs, dtype=torch.long))
+    out = plots_dir(os.path.dirname(ckpt_path), os.path.splitext(os.path.basename(ckpt_path))[0]) # logs/<run>/plots/model_<iter>
 
     runner = OnPolicyRunner(e, train_cfg_dict, log_dir=None, device="cuda")
     runner.load(ckpt_path)
@@ -277,6 +295,8 @@ def main():
 
     e.reset()
     obs = start_episodes(torch.arange(n, device=dev))
+    if args.record:
+        e.start_recording(os.path.join(out, "eval_stabilize.mp4"))
     with torch.inference_mode():
         while len(results["return"]) < args.num_episodes:
             obs, rew, dones, extras = e.step(policy(obs))
@@ -303,7 +323,7 @@ def main():
                 if alive[0]:
                     plot_log["t"].append(ep_len[0].item() * e.dt)
                     plot_log["err"].append(err[0].item())
-                    plot_log["err_vec"].append((e.commands[0, :3] - e.payload.get_pos()[0]).tolist())
+                    plot_log["err_vec"].append((e.ref_pos[0] - e.payload_pos[0]).tolist())
                     plot_log["vel"].append(e.payload.get_vel()[0].tolist())
                     plot_log["cone"].append(cone[0].item())
                     plot_log["swing"].append(e.payload_swing_angles[0].tolist())
@@ -314,8 +334,8 @@ def main():
                     plot_log["yaw_err"].append(e.payload_yaw_err[0].item())
                     plot_log["body_rates"].append(e.payload_body_rates[0].tolist())
                     plot_log["drone"].append(e.drone.get_pos()[0].tolist())
-                    plot_log["payload"].append(e.payload.get_pos()[0].tolist())
-                    plot_log["target"].append(e.commands[0, :3].tolist())
+                    plot_log["payload"].append(e.payload_pos[0].tolist())
+                    plot_log["target"].append(e.ref_pos[0].tolist())
 
             done_idx = dones.nonzero(as_tuple=False).flatten()
             if len(done_idx) == 0:
@@ -350,7 +370,6 @@ def main():
 
                 if i == 0 and not plot_done:
                     plot_log["settle_t"] = ep["settle_time_s"]
-                    out = plots_dir(os.path.dirname(ckpt_path), os.path.splitext(os.path.basename(ckpt_path))[0]) # logs/<run>/plots/model_<iter>
                     save_plot(plot_log, os.path.join(out, "eval_stabilize.png"), args, e.cfg)
                     save_motion_plot(plot_log, os.path.join(out, "eval_stabilize_motion.png"))
                     plot_done = True
@@ -358,6 +377,7 @@ def main():
             for buf in (ep_return, ep_len, max_err, max_cone, last_err, last_cone, last_yaw_err, last_unsettled):
                 buf[done_idx] = 0.0
             obs = start_episodes(done_idx)
+    e.stop_recording()
 
     # Summary
     res = {k: torch.tensor(v, dtype=torch.float32) for k, v in results.items()}
@@ -365,7 +385,11 @@ def main():
     print("\n========== STABILIZATION EVAL SUMMARY ==========")
     print(f"checkpoint        : {ckpt_path}")
     print(f"system            : {'full domain randomization' if args.dr else 'nominal'}, seed={args.seed}")
-    print(f"disturbance      : swing <= {args.swing_deg:.0f}deg, payload vel <= {args.payload_vel:.1f} m/s, drone rate <= {args.drone_rate:.1f} rad/s, yaw step <= {args.yaw_deg:.0f}deg")
+    if args.random:
+        print(f"disturbance       : random, swing <= {args.swing_deg:.0f}deg, payload vel <= {args.payload_vel:.1f} m/s, drone rate <= {args.drone_rate:.1f} rad/s, yaw step <= {args.yaw_deg:.0f}deg")
+    else:
+        print(f"disturbance       : swing {args.swing_deg:.0f}deg @ az {args.swing_az_deg:.0f}deg, payload vel {args.payload_vel:.1f} m/s @ az {args.payload_vel_az_deg:.0f}deg, "
+              f"drone rate {args.drone_rate:.1f} rad/s about {tuple(args.drone_rate_axis)}, yaw step {args.yaw_deg:.0f}deg")
     print(f"settle criteria   : err < {args.settle_pos} m, swing < {args.settle_swing_deg} deg, speed < {args.settle_vel} m/s, yaw < {args.settle_yaw_deg} deg (held to end)")
     print(f"episodes          : {len(results['return'])}")
     print(f"crash rate        : {res['crashed'].mean().item() * 100:.1f}%")

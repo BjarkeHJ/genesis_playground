@@ -121,6 +121,7 @@ class ReferenceConfig:
 
     # Observation and reset
     preview_s: tuple[float, ...] = (0.5, 1.0, 2.0, 3.0) # preview points r(τ + τ_k) - payload, observed in the heading frame [s]
+    # preview_s: tuple[float, ...] = () # preview points r(τ + τ_k) - payload, observed in the heading frame [s]
     p_mid_route_start: float = 0.0 # chance an episode starts at a uniform time along its route instead of the start
     init_yaw_err: float = math.radians(90.0) # initial payload yaw within this of the yaw reference
 

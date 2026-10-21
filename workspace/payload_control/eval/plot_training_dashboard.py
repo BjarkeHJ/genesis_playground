@@ -65,8 +65,8 @@ def plot_outcome(ax, S, ckpts):
         series.append((it, 100 * S["Episode_Reward/crash"][1] * cfg.episode_length_s / rw.w_crash, C_CRASH, (0, (2, 2)), "episodes ending in crash"))
     if "Task/success_rate" in S: # sparse (one point per window)
         series.append((*S["Task/success_rate"][:1], 100 * S["Task/success_rate"][1], C_SUCCESS, (0, (6, 2)), "success rate"))
-    if "Task/route_completion" in S:
-        series.append((*S["Task/route_completion"][:1], 100 * S["Task/route_completion"][1], C_COMPLETE, (0, (4, 1, 1, 1)), "route completion"))
+    # if "Task/route_completion" in S:
+        # series.append((*S["Task/route_completion"][:1], 100 * S["Task/route_completion"][1], C_COMPLETE, (0, (4, 1, 1, 1)), "route completion"))
     series.append((it, 100 * eplen / (cfg.episode_length_s * STEPS_PER_S), C_SINGLE, (0, (1, 2)), "episode length (% of max)"))
     for x, y, col, ls, name in series:
         sparse = name == "success rate" # one point per window: dots and a faster EMA

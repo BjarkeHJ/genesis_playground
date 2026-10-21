@@ -1,4 +1,7 @@
 import genesis.utils.geom as gu
+import genesis.utils.mesh as mu
+from genesis.utils.misc import tensor_to_array
+from genesis.utils.video_encoder import VideoEncoder
 from genesis.vis.viewer_plugins import ViewerPlugin
 
 import math
@@ -7,6 +10,60 @@ import numpy as np
 import torch
 
 # Viewer-only helpers. The viewer renders env 0, so everything here shows env 0 (rendered_envs_idx in the scene setup)
+
+class FollowCamera:
+    # Chase view of env 0: above and behind the drone (opposite its heading), looking down at `pitch` onto the
+    # drone-payload midpoint. Low-pass filtered (time constant tau) so attitude and yaw jitter don't shake the view
+    def __init__(self, dist=4.5, pitch=math.radians(60.0), tau=0.3):
+        self.dist, self.pitch, self.tau = dist, pitch, tau
+        self.center = None # filtered look-at point, None: snap on the next update
+        self.heading = None # filtered unit heading (xy)
+
+    def reset(self):
+        self.center = None
+
+    def update(self, drone_pos, payload_pos, yaw, dt):
+        # -> camera-to-world transform (4, 4) for the new state
+        center = 0.5 * (tensor_to_array(drone_pos) + tensor_to_array(payload_pos))
+        heading = np.array([math.cos(yaw), math.sin(yaw)])
+        if self.center is None:
+            self.center, self.heading = center, heading
+        else:
+            a = dt / (self.tau + dt)
+            self.center = self.center + a * (center - self.center)
+            h = self.heading + a * (heading - self.heading)
+            self.heading = h / max(np.linalg.norm(h), 1e-9) # through a 180° flip h passes near 0: keep the last direction
+        back = -math.cos(self.pitch) * np.array([*self.heading, 0.0])
+        pos = self.center + self.dist * (back + np.array([0.0, 0.0, math.sin(self.pitch)]))
+        return gu.pos_lookat_up_to_T(pos, self.center, np.array([0.0, 0.0, 1.0])) # world-z up: no roll creep
+
+class VideoRecorder:
+    # Offscreen camera on env 0 encoding one frame per policy step. Frames are captured by the env (not by the camera's
+    # own recording, which spaces frames by the viewer realtime_factor -- set to the decimation for viewer pacing, see
+    # attach_viewer_logs -- and would play the video sped up by it)
+    def __init__(self, scene, res=(1280, 720), pos=(0.0, 7.0, 3.0), lookat=(0.0, 0.0, 2.0), fov=50):
+        # debug=True: cameras skip debug objects (reference markers, route) otherwise. Must be added before scene.build()
+        self.cam = scene.add_camera(res=res, pos=pos, lookat=lookat, fov=fov, far=200.0, GUI=False, debug=True)
+        self.encoder = None
+        self.path = None
+
+    def start(self, path, fps):
+        self.encoder = VideoEncoder(path, fps, is_threaded=True)
+        self.path = path
+
+    def capture(self):
+        if self.encoder is None:
+            return
+        rgb = tensor_to_array(self.cam.render(rgb=True)[0])
+        self.encoder.write(rgb[0] if rgb.ndim == 4 else rgb)
+
+    def stop(self):
+        if self.encoder is None:
+            return None
+        self.encoder.close()
+        self.encoder = None
+        print(f"Saved video: {self.path}")
+        return self.path
 
 class TargetMarker:
     # Debug target [x, y, z, yaw_ref] (the current reference point): sphere at the position, arrow along yaw_ref
@@ -59,6 +116,27 @@ class PreviewMarkers:
                          for k, p in enumerate(poss)]
             return
         self.scene.update_debug_objects(self.objs, tuple(gu.trans_to_T(p) for p in poss))
+
+class TetherLines:
+    # Straight segments drone attach point -> payload attach point, visual only. Each is a unit-length cylinder along z
+    # (0..1), placed every step by a pose that rotates z onto the segment and scales it by the segment length
+    def __init__(self, scene, n, radius=0.004, color=(0.1, 0.1, 0.1, 1.0)):
+        self.scene, self.n, self.radius, self.color = scene, n, radius, color
+        self.objs = [] # drawn on the first update
+
+    def update(self, starts, ends):
+        # starts, ends (n, 3) drone and payload attach points
+        starts, ends = tensor_to_array(starts), tensor_to_array(ends)
+        if not self.objs:
+            unit = mu.create_line(np.zeros(3), np.array([0.0, 0.0, 1.0]), radius=self.radius, color=self.color)
+            self.objs = [self.scene.draw_debug_mesh(unit.copy()) for _ in range(self.n)]
+        poses = []
+        for p0, p1 in zip(starts, ends):
+            vec = p1 - p0
+            T = gu.trans_R_to_T(p0, gu.z_up_to_R(vec))
+            T[:3, 2] *= np.linalg.norm(vec)
+            poses.append(T)
+        self.scene.update_debug_objects(self.objs, tuple(poses))
 
 def attach_viewer_logs(env):
     # The viewer paces one sim_dt per update, but env.step() updates it once per decimation substeps: scale to stay real time

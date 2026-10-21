@@ -7,7 +7,7 @@ since the route end: path (top-down), reference and payload speed, tracking erro
 angles x/y (heading frame) with the cone angle (cable from vertical), actions. Color = speed, line style = component. Per-speed metrics are printed as a
 table (eval_route_batch.py for many routes and checkpoint comparisons).
 
-    python eval/eval_route.py <route> --run <run> [--ckpt N] [--seed 0] [--speeds 1 1.5 2] [--settle 5] [--viewer]
+    python eval/eval_route.py <route> --run <run> [--ckpt N] [--seed 0] [--speeds 1 1.5 2] [--settle 5] [--viewer] [--record] [--follow]
     route: random | survey | loop | zigzag | stop (sampled with --seed) | figure8
 """
 import argparse
@@ -139,6 +139,8 @@ def main():
     parser.add_argument("--settle", type=float, default=5.0, help="Time recorded after the route end [s]")
     parser.add_argument("--settle_tol", type=float, default=0.1, help="Position error that counts as settled after the stop [m]")
     parser.add_argument("--viewer", action="store_true", help="Show the first speed")
+    parser.add_argument("--record", action="store_true", help="Save a video of the first speed next to the plot (works without --viewer)")
+    parser.add_argument("--follow", action="store_true", help="Viewer/video camera chases the drone from above and behind")
     parser.add_argument("--no_compile", action="store_true", help="Skip torch.compile (faster startup, slower stepping)")
     args = parser.parse_args()
 
@@ -156,7 +158,7 @@ def main():
     # One env per speed: nominal system, at rest on the reference start, no timeout before the longest run ends
     env_cfg = EnvConfig(num_envs=len(routes), episode_length_s=float(durations.max()) + args.settle + 2.0,
                         torch_compile=not args.no_compile, ref_cfg=dataclasses.replace(cfg0.ref_cfg, p_mid_route_start=0.0))
-    e = PayloadControlEnv(env_cfg, show_viewer=args.viewer, device="cuda", bank=bank)
+    e = PayloadControlEnv(env_cfg, show_viewer=args.viewer, device="cuda", bank=bank, record=args.record, follow=args.follow)
     e.dr.enabled = False
     e.ref.fix_routes(torch.arange(len(routes)))
 
@@ -164,14 +166,17 @@ def main():
     runner.load(ckpt_path)
     policy = runner.get_inference_policy(device=e.device) # deterministic: actor mean
 
+    out_dir = plots_dir(os.path.dirname(ckpt_path), os.path.splitext(os.path.basename(ckpt_path))[0])
+    tag = args.route if args.route in FIXED_ROUTES else f"{args.route}_s{args.seed}"
+    if args.record:
+        e.start_recording(os.path.join(out_dir, f"eval_route_{tag}_{args.speeds[0]:g}mps.mp4"))
     h, crash = rollout(e, policy, bank.duration, args.settle, e.dt)
+    e.stop_recording()
     cases = [{"name": f"{args.route} @{v:g}", "group": args.route, "speed": v, "route": r} for v, r in zip(args.speeds, routes)]
     results = [case_metrics(c, h, j, crash[j], float(durations[j]), args.settle, args.settle_tol, e.dt) for j, c in enumerate(cases)]
     print(f"\ncheckpoint {ckpt_path} | err/cross/dev/refdev/final [m], lag/settle [s], swing/yaw/tilt [deg]")
     print_table([{**r, "crash_rate": float(r["crashed"])} for r in results], "Per speed")
 
-    out_dir = plots_dir(os.path.dirname(ckpt_path), os.path.splitext(os.path.basename(ckpt_path))[0])
-    tag = args.route if args.route in FIXED_ROUTES else f"{args.route}_s{args.seed}"
     path = os.path.join(out_dir, f"eval_route_{tag}.png")
     plot(args.route, args.seed, args.speeds, routes, results, h, crash, durations, args.settle, e.dt, path)
     print(f"\nsaved {path}")

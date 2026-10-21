@@ -170,6 +170,8 @@ def main():
     parser.add_argument("--settle_tol", type=float, default=0.1, help="Position error that counts as settled after the stop [m]")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--viewer", action="store_true", help="Show env 0 (the first case)")
+    parser.add_argument("--record", action="store_true", help="Save a video of env 0 (the first case) next to the plots (works without --viewer)")
+    parser.add_argument("--follow", action="store_true", help="Viewer/video camera chases env 0's drone from above and behind")
     parser.add_argument("--no_compile", action="store_true", help="Skip torch.compile (faster startup, slower stepping)")
     parser.add_argument("--plot_cols", type=int, default=4, help="Cases per row in the figures")
     args = parser.parse_args()
@@ -188,7 +190,7 @@ def main():
     # One env per case, no timeout before the longest case ends, routes from their start
     env_cfg = EnvConfig(num_envs=len(cases), episode_length_s=float(durations.max()) + args.settle + 2.0,
                         torch_compile=not args.no_compile, ref_cfg=dataclasses.replace(base_cfg.ref_cfg, p_mid_route_start=0.0))
-    e = PayloadControlEnv(env_cfg, show_viewer=args.viewer, device="cuda", bank=bank)
+    e = PayloadControlEnv(env_cfg, show_viewer=args.viewer, device="cuda", bank=bank, record=args.record, follow=args.follow)
     e.dr.enabled = args.dr
     e.ref.fix_routes(torch.arange(len(cases)))
 
@@ -196,7 +198,12 @@ def main():
     runner.load(ckpt_path)
     policy = runner.get_inference_policy(device=e.device) # deterministic: actor mean
 
+    out_dir = plots_dir(os.path.dirname(ckpt_path), os.path.splitext(os.path.basename(ckpt_path))[0])
+    tag = f"{args.suite}{'_dr' if args.dr else ''}"
+    if args.record:
+        e.start_recording(os.path.join(out_dir, f"eval_route_{tag}_{cases[0]['name'].replace(' ', '').replace('@', '_')}.mp4"))
     h, crash = rollout(e, policy, bank.duration, args.settle, e.dt)
+    e.stop_recording()
     results = [case_metrics(c, h, i, crash[i], float(durations[i]), args.settle, args.settle_tol, e.dt) for i, c in enumerate(cases)]
     agg = aggregate(results)
 
@@ -212,8 +219,6 @@ def main():
     overall = {k: float(np.nanmean([r[k] for r in agg])) for k in agg[0] if isinstance(agg[0][k], float) and k != "speed"}
     print_table([{"name": "ALL", **overall}], "Overall")
 
-    out_dir = plots_dir(os.path.dirname(ckpt_path), os.path.splitext(os.path.basename(ckpt_path))[0])
-    tag = f"{args.suite}{'_dr' if args.dr else ''}"
     with open(os.path.join(out_dir, f"eval_route_{tag}.json"), "w") as fh:
         json.dump({"checkpoint": ckpt_path, "args": vars(args), "overall": overall, "per_group": by_group, "per_case": agg,
                    "runs": results}, fh, indent=1)

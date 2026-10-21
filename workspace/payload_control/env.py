@@ -13,16 +13,20 @@ from components.flight_control import FlightController
 from components.domain_rand import DomainRandomizer
 from components.reference import TrajectoryBank, ReferenceTrajectory
 from components.rewards import RewardsMixin
-from components.viewer import TargetMarker, RoutePath, PreviewMarkers, attach_viewer_logs
+from components.viewer import TargetMarker, RoutePath, PreviewMarkers, TetherLines, FollowCamera, VideoRecorder, attach_viewer_logs
 
 class PayloadControlEnv(RewardsMixin):
     # Drone carrying a tethered payload; the policy commands [thrust, roll, pitch, yaw rate] so the payload tracks a
     # reference trajectory. Components: FlightController (action -> RPM), TetherModel (suspension wrench),
     # DomainRandomizer (per-episode params and initial state), ReferenceTrajectory (per-env route from the trajectory
     # bank, its clock and yaw reference), RewardsMixin (reward terms). Only this class talks to the Genesis scene/solver
-    def __init__(self, env_cfg: EnvConfig, show_viewer: bool=False, device: str="cuda", bank: TrajectoryBank=None):
+    def __init__(self, env_cfg: EnvConfig, show_viewer: bool=False, device: str="cuda", bank: TrajectoryBank=None,
+                 record: bool=False, follow: bool=False):
         # bank: routes to draw from; None loads the trajectory bank of the configs (evaluations pass their own)
+        # record: offscreen camera on env 0 for videos (start_recording / stop_recording), works headless
+        # follow: viewer and recording camera chase env 0's drone (FollowCamera)
         self.show_viewer = show_viewer
+        self.record = record
         self.device = torch.device(device)
 
         self.cfg = env_cfg
@@ -70,46 +74,46 @@ class PayloadControlEnv(RewardsMixin):
             device=self.device
         )
 
-        # Payload reference: routes solved offline (utils/build_bank.py builds the bank for the current configs), placed
-        # per env at reset; ref_offsets are the current point and the preview times
+        # Trajectories (generated offline and stored in TrajectoryBank)
         self.bank = bank if bank is not None else TrajectoryBank.load(self.cfg.bank_cfg, self.cfg.route_cfg, self.cfg.sampler_cfg, device=self.device)
         self.ref = ReferenceTrajectory(self.bank, self.num_envs, self.device, self.ref_cfg, compile=self.cfg.torch_compile)
         self.ref_offsets = torch.tensor((0.0, *self.ref_cfg.preview_s), device=self.device, dtype=gs.tc_float)
 
-        # The env's torch code is hundreds of tiny ops, bound by Python dispatch and kernel launches regardless of num_envs.
-        # torch.compile fuses each stage into a few kernels (first steps are slow while it compiles). Wrap stages here only:
-        # helpers they call (components, math_utils) are inlined into the stage, so a separately compiled helper only adds dispatch
-        maybe_compile = torch.compile if self.cfg.torch_compile else (lambda fn: fn)
-        self._setpoints_fn = maybe_compile(self.ctrl.setpoints)
-        self._rpms_fn = maybe_compile(self.ctrl.rpms)
-        self._tether_wrench_fn = maybe_compile(self.tether.wrench)
-        self._buffers_fn = maybe_compile(self._compute_buffers)
-        self._post_step_fn = maybe_compile(self._post_step)
-        self._observations_fn = maybe_compile(self._compute_observations)
+        # torch.compile for faster simulation. Env's many tiny ops fused into a few kernels. Causes slow startup.
+        torch_compile = torch.compile if self.cfg.torch_compile else (lambda fn: fn)
+        self._setpoints_fn = torch_compile(self.ctrl.setpoints)
+        self._rpms_fn = torch_compile(self.ctrl.rpms)
+        self._tether_wrench_fn = torch_compile(self.tether.wrench)
+        self._buffers_fn = torch_compile(self._compute_buffers)
+        self._post_step_fn = torch_compile(self._post_step)
+        self._observations_fn = torch_compile(self._compute_observations)
 
         self._init_buffers()
         self._init_rewards()
 
-        # Viewer-only drawing of env 0's reference: current point and yaw reference, preview points, full route
-        self.target_marker = TargetMarker(self.scene) if self.show_viewer else None
-        self.preview_markers = PreviewMarkers(self.scene, len(self.ref_cfg.preview_s)) if self.show_viewer else None
-        self.route_path = RoutePath(self.scene) if self.show_viewer else None
+        # Viewer/video-only drawing of env 0's reference: current point and yaw reference, preview points, full route
+        self.draw = self.show_viewer or self.record
+        self.target_marker = TargetMarker(self.scene) if self.draw else None
+        self.preview_markers = PreviewMarkers(self.scene, len(self.ref_cfg.preview_s)) if self.draw else None
+        self.route_path = RoutePath(self.scene) if self.draw else None
+        self.tether_lines = TetherLines(self.scene, self.sys_cfg.num_tethers) if self.draw else None
         self.ref_points0 = None # env 0's reference now and at the preview times (1+K, 3), kept for the viewer
+        self.follow_cam = FollowCamera() if follow and self.draw else None
+
         if self.show_viewer:
             attach_viewer_logs(self)
 
         if self.cfg.torch_compile:
             self._warm_up_compile()
+
         self.reset()
 
     # ======================== SETUP ========================
 
     def _warm_up_compile(self):
-        # Compile every stage now rather than inside the first training iteration: the first call of each compiled stage
-        # traces and compiles it (seconds), so one throwaway hover step pays for all of them. The reset after it (in
-        # __init__) restarts every episode; the success counters are cleared here since reset() leaves them alone
+        # Compile every stage now rather than inside the first training iteration
         self.reset()
-        self.step(torch.zeros((self.num_envs, self.num_actions), device=self.device, dtype=gs.tc_float))
+        self.step(torch.zeros((self.num_envs, self.num_actions), device=self.device, dtype=gs.tc_float)) # 0-action step to force every function call
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device) # compile + first launches done before construction returns
         self.success_count.zero_()
@@ -173,6 +177,8 @@ class PayloadControlEnv(RewardsMixin):
             ),
         )
         self.payload_attach_links = [self.payload.get_link(x) for x in payload_attach_links]
+
+        self.video = VideoRecorder(self.scene) if self.record else None # camera must exist before the build
 
         self.scene.build(n_envs=self.num_envs)
 
@@ -260,7 +266,15 @@ class PayloadControlEnv(RewardsMixin):
         self._update_buffers()
         self._update_observations()
         self._draw_reference()
+        self._update_camera()
         return self.get_observations()
+
+    def start_recording(self, path):
+        # Video of env 0 from here on, one frame per policy step (needs record=True)
+        self.video.start(path, fps=1.0 / self.dt)
+
+    def stop_recording(self):
+        return self.video.stop() if self.video is not None else None
 
     def step(self, actions):
         self.actions_raw = actions # pre-clip policy sample, for the action bound penalty
@@ -282,6 +296,7 @@ class PayloadControlEnv(RewardsMixin):
         self._update_observations()
         self.prev_actions = self.actions
         self._draw_reference()
+        self._update_camera()
 
         self._log_success_rate()
 
@@ -302,6 +317,8 @@ class PayloadControlEnv(RewardsMixin):
         # New route (each env is its own world, so every route starts at the origin), then the initial state moved onto
         # its start point and moving with it (mid-route starts). Payload heading within init_yaw_err of the yaw reference
         n = len(envs_idx)
+        if self.follow_cam is not None and (envs_idx == 0).any():
+            self.follow_cam.reset() # env 0 jumps to a new start: snap instead of swinging over
         ref_pos0, ref_vel0 = self.ref.assign_random(envs_idx, torch.zeros((n, 2), device=self.device), p_mid_route=self.ref_cfg.p_mid_route_start)
         self._draw_route(envs_idx)
         yaw_err = self.ref_cfg.init_yaw_err * (1.0 if self.dr.enabled else 0.0)
@@ -361,7 +378,7 @@ class PayloadControlEnv(RewardsMixin):
         ang = self.rigid_solver.get_links_ang(self.base_links_idx)
         # Reference at τ + ref_offsets (world): current point and preview, outside the compiled stage (searchsorted/gather)
         ref_pos, ref_vel = self.ref.eval(self.ref_offsets, max_order=1)
-        if self.show_viewer:
+        if self.draw:
             self.ref_points0 = ref_pos[0]
         self._buffers_fn(pos, quat, vel, ang, ref_pos, ref_vel[:, 0], self.ref.psi_ref, self.ref.psi_dot_ref)
 
@@ -521,6 +538,21 @@ class PayloadControlEnv(RewardsMixin):
         if self.target_marker is not None:
             self.target_marker.update(torch.cat([self.ref_pos[0], self.ref.psi_ref[:1]]))
             self.preview_markers.update(self.ref_points0[1:])
+
+            # Tether segments of env 0, attach links ordered [drone..., payload...] (see tether_links_idx)
+            pos = self.rigid_solver.get_links_pos(self.tether_links_idx, envs_idx=[0])[0]
+            self.tether_lines.update(pos[:self.sys_cfg.num_tethers], pos[self.sys_cfg.num_tethers:])
+
+    def _update_camera(self):
+        # Viewer/video-only: move the follow camera onto env 0's current state, then capture a video frame
+        if self.follow_cam is not None:
+            T = self.follow_cam.update(self.drone.get_pos()[0], self.payload_pos[0], self.drone_yaw[0].item(), self.dt)
+            if self.show_viewer:
+                self.scene.viewer.set_camera_pose(pose=T)
+            if self.video is not None:
+                self.video.cam.set_pose(transform=T)
+        if self.video is not None:
+            self.video.capture()
 
     def _draw_route(self, envs_idx, spacing_s=0.1, max_points=1000):
         # Viewer-only, when env 0 gets a new route: its full reference path, sampled every spacing_s
