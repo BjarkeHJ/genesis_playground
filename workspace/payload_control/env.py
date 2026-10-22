@@ -106,7 +106,7 @@ class PayloadControlEnv(RewardsMixin):
         if self.cfg.torch_compile:
             self._warm_up_compile()
 
-        self.reset()
+        self.reset() #
 
     # ======================== SETUP ========================
 
