@@ -75,15 +75,15 @@
   </link>
 
   {% for x, y in attachment_points %}
-  <link name="attach_{{ loop.index0 }}">
+  <link name="attach{{ loop.index0 }}_link">
     <visual>
       <geometry><sphere radius="0.01"/></geometry>
       <material name="payload_planel"/>
     </visual>
   </link>
-  <joint name="attach_{{ loop.index0 }}_joint" type="fixed">
+  <joint name="attach{{ loop.index0 }}_joint" type="fixed">
     <parent link="payload"/>
-    <child link="attach_{{ loop.index0 }}"/>
+    <child link="attach{{ loop.index0 }}_link"/>
     <origin xyz="{{ x }} {{ y }} {{ size_z / 2}}" rpy="0 0 0"/>
   </joint>
   {% endfor %}

@@ -20,8 +20,7 @@ class PayloadControlEnv(RewardsMixin):
     # reference trajectory. Components: FlightController (action -> RPM), TetherModel (suspension wrench),
     # DomainRandomizer (per-episode params and initial state), ReferenceTrajectory (per-env route from the trajectory
     # bank, its clock and yaw reference), RewardsMixin (reward terms). Only this class talks to the Genesis scene/solver
-    def __init__(self, env_cfg: EnvConfig, show_viewer: bool=False, device: str="cuda", bank: TrajectoryBank=None,
-                 record: bool=False, follow: bool=False):
+    def __init__(self, env_cfg: EnvConfig, show_viewer: bool=False, device: str="cuda", bank: TrajectoryBank=None, record: bool=False, follow: bool=False):
         # bank: routes to draw from; None loads the trajectory bank of the configs (evaluations pass their own)
         # record: offscreen camera on env 0 for videos (start_recording / stop_recording), works headless
         # follow: viewer and recording camera chase env 0's drone (FollowCamera)
@@ -54,7 +53,7 @@ class PayloadControlEnv(RewardsMixin):
         self.payload_init_quat = torch.tensor(self.sys_cfg.payload_reset_quat, device=self.device, dtype=gs.tc_float)
 
         self.ctrl = FlightController(
-            self.cfg, 
+            self.cfg,
             self.drone, 
             total_mass=drone_mass0 + payload_mass0, 
             gravity=self.gravity, 
@@ -166,7 +165,7 @@ class PayloadControlEnv(RewardsMixin):
         )
         self.drone_attach_links = [self.drone.get_link(x) for x in drone_attach_links]
 
-        payload_attach_links = [f"attach_{x}" for x in range(self.sys_cfg.num_tethers)]
+        payload_attach_links = [f"attach{x}_link" for x in range(self.sys_cfg.num_tethers)]
         self.payload = self.scene.add_entity(
             gs.morphs.URDF(
                 file=PAYLOAD_PATH,

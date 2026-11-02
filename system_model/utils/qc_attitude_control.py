@@ -81,8 +81,6 @@ def wrap_pi(a):
 
 class QCAttitudeController:
     # Top level: (roll_sp, pitch_sp, yawrate_sp) + attitude -> body rate setpoint
-    # Run at sim rate (every inner step) with the current attitude; the setpoint may be held from the policy.
-
     def __init__(self, num_envs, dt, device, params: AttitudeControlParams = AttitudeControlParams(), dtype=torch.float32):
         self.num_envs = num_envs
         self.dt = dt

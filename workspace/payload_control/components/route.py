@@ -89,6 +89,7 @@ class Route:
         radius = np.minimum(np.maximum(v_corner**2 / a_lat, MIN_RADIUS), r_max)
         d = radius * tan_h
 
+
         radius, v_corner, d = (np.where(is_stop, 0.0, x) for x in (radius, v_corner, d))
         return radius, v_corner, is_stop, d
 
