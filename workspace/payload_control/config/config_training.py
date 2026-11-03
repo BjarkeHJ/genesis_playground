@@ -1,0 +1,52 @@
+from dataclasses import dataclass, field
+
+@dataclass
+class PPOConfig:
+    class_name: str = "PPO"
+    clip_param: float = 0.2
+    desired_kl: float = 0.005 # orig 0.01
+    entropy_coef: float = 0.004
+    gamma: float = 0.998
+    lam: float = 0.97 
+    learning_rate: float = 0.0003
+    max_grad_norm: float = 1.0
+    num_learning_epochs: int = 5
+    num_mini_batches: int = 4
+    schedule: str = "adaptive"
+    use_clipped_value_loss: bool = True
+    value_loss_coef: float = 1.0
+
+@dataclass
+class GaussianDistributionConfig:
+    class_name: str = "GaussianDistribution"
+    init_std: float = 0.5 # orig 1.0
+    std_type: str = "scalar"
+
+@dataclass
+class ActorConfig:
+    class_name: str = "MLPModel"
+    hidden_dims: list[int] = field(default_factory=lambda: [256, 256])
+    activation: str = "tanh"
+    distribution_cfg: GaussianDistributionConfig = field(default_factory=GaussianDistributionConfig)
+
+@dataclass
+class CriticConfig:
+    class_name: str = "MLPModel"
+    hidden_dims: list[int] = field(default_factory=lambda: [256, 256])
+    activation: str = "tanh"
+
+@dataclass
+class ObsGroupsConfig:
+    actor: list[str] = field(default_factory=lambda: ["policy"])
+    critic: list[str] = field(default_factory=lambda: ["critic"]) # asynchronous actor-critic with critic-priviledged observations
+
+@dataclass
+class TrainConfig:
+    algorithm: PPOConfig = field(default_factory=PPOConfig)
+    actor: ActorConfig = field(default_factory=ActorConfig)
+    critic: CriticConfig = field(default_factory=CriticConfig)
+    obs_groups: ObsGroupsConfig = field(default_factory=ObsGroupsConfig)
+    num_steps_per_env: int = 400
+    save_interval: int = 100
+    run_name: str = ""
+    logger: str = "tensorboard"
