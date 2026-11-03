@@ -6,7 +6,7 @@ class Rotor:
     px: float
     py: float
     km: float # moment ratio, > 0 for CCW rotor
-    ct: float = 6.5
+    ct: float = 6.5 # PX4 default - drops out in most computations. Only matters for weak-axis cutoff in mixer
 
 @dataclass(frozen=True)
 class Airframe:

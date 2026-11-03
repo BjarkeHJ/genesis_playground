@@ -51,12 +51,6 @@ class DomainRandomizationConfig:
     payload_mass_scale: Uniform = Uniform(0.8, 1.2)
     drone_mass_scale: Uniform = Uniform(0.8, 1.2)
 
-    # Initial State
-    init_rel_yaw_max: float = math.radians(15.0)
-    init_swing_angle_max: float = math.radians(30)
-    init_swing_rate: float = 0.5
-    init_drone_vel: float = 0.5
-
 # Trajectory
 @dataclass(frozen=True)
 class TrajectoryConfig:
