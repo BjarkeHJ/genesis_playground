@@ -1,7 +1,7 @@
 import math
 from dataclasses import dataclass, field
 
-from .config_components import FlightControllerConfig, TetherModelConfig, DomainRandomizationConfig, TrajectoryConfig
+from .config_components import FlightControllerConfig, TetherModelConfig, DomainRandomizationConfig, SensorNoiseConfig, TrajectoryConfig
 
 @dataclass(frozen=True)
 class Termination:
@@ -42,6 +42,7 @@ class EnvConfig:
     fc_cfg: FlightControllerConfig = field(default_factory=FlightControllerConfig)
     tether_cfg: TetherModelConfig = field(default_factory=TetherModelConfig)
     dr_cfg: DomainRandomizationConfig = field(default_factory=DomainRandomizationConfig)
+    sensor_cfg: SensorNoiseConfig = field(default_factory=SensorNoiseConfig)
     traj_cfg: TrajectoryConfig = field(default_factory=TrajectoryConfig)
 
     sim_dt: float = 0.005 # physics rate
@@ -52,7 +53,7 @@ class EnvConfig:
     num_actions: int = 4
     clip_actions: float = 1.0
     num_obs: int = field(init=False)
-    num_priv_obs: int = 8 # Note: in addition to num_obs
+    num_critic_obs: int = 8 # Note: in addition to num_obs
     preview_points_s: tuple[float, ...] = (0.0, 0.3, 0.8, 1.5, 2.0) # Should start at 0.0 for current time track (K-dim)
 
     payload_init_altitude: float = 5.0
@@ -60,8 +61,8 @@ class EnvConfig:
     obs: Observations = field(default_factory=Observations)
     rewards: Rewards = field(default_factory=Rewards)
     episode_termination: Termination = field(default_factory=Termination)
-    succes_mean_track_err = 0.25
-    succes_interval = 1200
+    succes_mean_track_err: float = 0.25
+    succes_interval: int = 1200
 
     def __post_init__(self):
         object.__setattr__(self, "policy_dt", self.sim_dt * self.decimation)

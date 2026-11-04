@@ -47,7 +47,7 @@ class TrainConfig:
     critic: CriticConfig = field(default_factory=CriticConfig)
     obs_groups: ObsGroupConfig = field(default_factory=ObsGroupConfig)
 
-    num_steps_per_env: int = 256 # rollout L (test 64??)
+    num_steps_per_env: int = 128 # orig 256 rollout L (test 64??)
     save_interval: int = 100
     run_nam: str = ""
     logger: str = "tensorboard"

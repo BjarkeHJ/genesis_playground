@@ -51,6 +51,24 @@ class DomainRandomizationConfig:
     payload_mass_scale: Uniform = Uniform(0.8, 1.2)
     drone_mass_scale: Uniform = Uniform(0.8, 1.2)
 
+@dataclass(frozen=True)
+class Sensor:
+    white: tuple[float, float, float] = (0.0, 0.0, 0.0) # std per sample, per axis
+    bias: tuple[float, float, float] = (0.0, 0.0, 0.0) # per-ep offset ~U(+-bias), per axis
+    rate_hz: float = 0.0 # update rate, 0 = every policy step
+    latency_s: Uniform = Uniform(0.0, 0.0, nominal=0.0) # per-ep delay, rounded to whole policy steps
+@dataclass(frozen=True)
+class SensorNoiseConfig:
+    enabled: bool = True # enable sensor noise
+    drone_pos: Sensor =     Sensor(white=(0.01, 0.01, 0.02),    bias=(0.02, 0.02, 0.03), rate_hz=10.0,  latency_s=Uniform(0.04, 0.12, nominal=0.0))
+    drone_vel: Sensor =     Sensor(white=(0.05, 0.05, 0.05),                             rate_hz=10.0,  latency_s=Uniform(0.04, 0.12, nominal=0.0))
+    drone_att: Sensor =     Sensor(white=(0.005, 0.005, 0.2),   bias=(0.02, 0.02, 0.05))
+    drone_gyro: Sensor =    Sensor(white=(0.02, 0.02, 0.02),    bias=(0.01, 0.01, 0.01))
+    payload_pos:  Sensor =  Sensor(white=(0.01, 0.01, 0.02),    bias=(0.02, 0.02, 0.03), rate_hz=10.0,  latency_s=Uniform(0.04, 0.12, nominal=0.0))
+    payload_vel:  Sensor =  Sensor(white=(0.05, 0.05, 0.05),                             rate_hz=10.0,  latency_s=Uniform(0.04, 0.12, nominal=0.0))
+    payload_att:  Sensor =  Sensor(white=(0.01, 0.01, 0.03),    bias=(0.03, 0.03, 0.05))
+    payload_gyro: Sensor =  Sensor(white=(0.02, 0.02, 0.02),    bias=(0.01, 0.01, 0.01))
+    
 # Trajectory
 @dataclass(frozen=True)
 class TrajectoryConfig:

@@ -4,13 +4,17 @@ import torch
 import math
 from tensordict import TensorDict
 
-from config import EnvConfig, DRONE_PATH, PAYLOAD_PATH, TRAJ_BANK_DIR
+from config.config_env import EnvConfig
+from config.paths import DRONE_PATH, PAYLOAD_PATH, TRAJ_BANK_DIR
+
+from utils.genesis_viewer import GenesisFollower, GenesisRecorder, GenesisViewer
+from utils.genesis_helpers import silence_asset_warnings, airframe_from_genesis
+from utils.torch_math_helpers import *
+
 from components.flight_control import FlightController
 from components.tether_model import TetherModel
-from components.domain_randomization import DomainRandomizer
+from components.domain_randomization import DomainRandomizer, SensorModel
 from components.trajectory import TrajectoryBank
-
-from utils import *
 
 class SlungPayloadControlEnv:
     def __init__(self, num_envs: int, env_cfg: EnvConfig, device: str="cuda", show_viever: bool=False):
@@ -148,6 +152,13 @@ class SlungPayloadControlEnv:
             self.device,
             gs.tc_float
         )
+        self.sensors = SensorModel(
+            self.cfg.sensor_cfg,
+            self.num_envs,
+            self.dt,
+            self.device,
+            gs.tc_float
+        )
         self.traj_bank = TrajectoryBank.load_or_build(
             self.cfg.traj_cfg,
             os.path.join(TRAJ_BANK_DIR, "bank.npz"),
@@ -160,16 +171,21 @@ class SlungPayloadControlEnv:
             self.controller.compile()
             print("[TetherModel] Compiling torch kernels...")
             self.tether_model.compile()
+            print("[SensorModel] Compiling torch kernels...")
+            self.sensors.compile()
             print("[SlungPayloadControlEnv] Compiling torch kernels...")
             self._compute_buffers = torch.compile(self._compute_buffers, dynamic=False)
             self._update_observations = torch.compile(self._update_observations, dynamic=False)
             self._post_step = torch.compile(self._post_step, dynamic=False)
 
-            dummy_pos = torch.zeros((self.num_envs, 2, 3), device=self.device, dtype=gs.tc_float)
-            dummy_quat = torch.zeros((self.num_envs, 2, 4), device=self.device, dtype=gs.tc_float)
-            dummy_quat[..., 0] = 1.0 # identity
-            self._compute_buffers(dummy_pos, dummy_quat, dummy_pos.clone(), dummy_pos.clone()) # (pos, quat, vel, ang)
+            # Step through compiled env functions to trigger compile pre-build
+            dummy_3vec = torch.zeros((self.num_envs, 2, 3), device=self.device, dtype=gs.tc_float)
+            dummy_4vec = torch.zeros((self.num_envs, 2, 4), device=self.device, dtype=gs.tc_float)
+            dummy_4vec[..., 0] = 1.0 # identity
+            self._compute_buffers(dummy_3vec, dummy_4vec, dummy_3vec.clone(), dummy_3vec.clone()) # (pos, quat, vel, ang)
+            self.raw_states = (dummy_3vec, dummy_4vec, dummy_3vec.clone(), dummy_3vec.clone()) # (pos, quat, vel, ang)
             self._update_observations()
+            self.raw_states = None
             self._post_step()
 
             self.success_count.zero_()
@@ -183,6 +199,11 @@ class SlungPayloadControlEnv:
         self.controller.bind(airframe_from_genesis(self.drone, self.cfg.fc_cfg.twr_max, payload_mass=self.mass0[1].item()))
         # Bind domain randomization
         self.domain_rand.bind(self._apply_domain_rand)
+
+        n = self.cfg.tether_cfg.num_tethers
+        p = self.rigid_solver.get_links_pos(self.tether_links_idx, [0], relative=True)[0]
+        b = self.rigid_solver.get_links_pos(self.base_links_idx, [0], relative=True)[0]
+        self.attach_off = p[:n] - b[0], p[n:] - b[1] # drone, payload (n, 3)
 
         # Viewer logging on-screen
         if self.show_viewer:
@@ -201,7 +222,7 @@ class SlungPayloadControlEnv:
 
         # Environment state buffers
         self.obs_buf = zeros(self.cfg.num_obs)
-        self.priv_obs_buf = zeros(self.cfg.num_priv_obs)
+        self.critic_obs_buf = zeros(self.cfg.num_obs + self.cfg.num_critic_obs)
         self.reward_buf = zeros()
         self.reset_buf = zeros(dtype=gs.tc_bool)
         self.episode_length_buf = zeros(dtype=gs.tc_int)
@@ -227,8 +248,9 @@ class SlungPayloadControlEnv:
         self.prev_actions = zeros(self.num_actions)
         self.actions_raw = zeros(self.num_actions)
         self.payload_world_pos = zeros(3) # crash-conditions
-        self.swing_energy = zeros()        
-
+        self.swing_energy = zeros()
+        self.raw_states = None # (pos, quat, vel, ang) of [drone, payload] from last _update_buffers
+    
         # Rewards (OBS: on naming convention)
         self.reward_fns = {name: getattr(self, f"_reward_{name}") for name in self.cfg.rewards.reward_terms}
         self.ep_rew_sum = zeros(len(self.cfg.rewards.reward_terms))
@@ -252,7 +274,7 @@ class SlungPayloadControlEnv:
     def get_observations(self):
         return TensorDict({
             "actor": self.obs_buf,
-            "critic": torch.cat([self.obs_buf, self.priv_obs_buf], dim=-1),
+            "critic": self.critic_obs_buf,
         }, batch_size=[self.num_envs])
 
     def reset(self):
@@ -277,6 +299,7 @@ class SlungPayloadControlEnv:
 
         # New parameters
         self.domain_rand.randomize(envs_idx)
+        self.sensors.reset(envs_idx)
 
         # New trajectories
         self.traj_idx[envs_idx] = self.traj_bank.sample_ids(len(envs_idx))
@@ -290,7 +313,12 @@ class SlungPayloadControlEnv:
         # Init state (rought est.)
         quat0 = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device, dtype=gs.tc_float).expand(len(envs_idx), 4)
         payload_pos = p0
-        drone_pos = p0 + self.tether_model.rest_length[envs_idx, None] * -self.world_down
+        # drone_pos = p0 + self.tether_model.rest_length[envs_idx, None] * -self.world_down
+        
+        d_off = self.attach_off[0] - self.attach_off[1]
+        h = self.tether_model.rest_length[envs_idx, None] - d_off[:, 2]
+        drone_pos = p0 + h.mean(dim=1, keepdim=True) * -self.world_down
+
         zeros = torch.zeros_like(v0)
         self.rigid_solver.set_qpos(torch.cat([drone_pos, quat0, payload_pos, quat0], dim=1), self.base_qs_idx, envs_idx)
 
@@ -334,7 +362,7 @@ class SlungPayloadControlEnv:
         self._update_buffers()
         self.extras["time_outs"] = self._post_step()
         self.reset_idx(self.reset_buf.nonzero(as_tuple=False).reshape(-1, ))
-        self._update_buffers() # do something smart here to not run full again
+        self._update_buffers(compute=False) # does not compute all buffers - only necessary for observations
         self._update_observations()
         self.prev_actions[:] = self.actions
 
@@ -385,14 +413,16 @@ class SlungPayloadControlEnv:
 
         return timeout
 
-    def _update_buffers(self):
+    def _update_buffers(self, compute=True):
         # Read genesis states from solver
         # [drone,..., payload, ...]
         pos = self.rigid_solver.get_links_pos(self.base_links_idx, relative=True)
         quat = self.rigid_solver.get_links_quat(self.base_links_idx, relative=True)
         vel = self.rigid_solver.get_links_vel(self.base_links_idx, relative=True)
         ang = self.rigid_solver.get_links_ang(self.base_links_idx)
-        self._compute_buffers(pos, quat, vel, ang)
+        self.raw_states = (pos, quat, vel, ang)
+        if compute:
+            self._compute_buffers(pos, quat, vel, ang)
 
     def _compute_buffers(self, pos, quat, vel, ang):
         drone_p, payload_p = pos.unbind(1)
@@ -453,6 +483,16 @@ class SlungPayloadControlEnv:
         self.payload_world_pos[:] = payload_p
 
     def _update_observations(self):
+        pos, quat, vel, ang = self.raw_states
+        p, q, v, rates = self.sensors.measure(pos, quat, vel, quat_rotate_inverse(quat, ang))
+        self._compute_buffers(p, q, v, quat_rotate(q, rates))
+        self.obs_buf = self._observations()
+
+        # clean
+        self._compute_buffers(pos, quat, vel, ang)
+        self.critic_obs_buf = torch.cat([self._observations(), self.domain_rand.priviledged_obs()], dim=-1)
+
+    def _observations(self):
         s = self.cfg.obs
 
         # tau-horizon scaling to not saturate the clamp
@@ -461,7 +501,7 @@ class SlungPayloadControlEnv:
         pos_scale = 1.0 / (1.0 / s.scale_pl_p + vmax * tau + 0.5 * amax * tau * tau)
         vel_scale = 1.0 / (1.0 / s.scale_pl_v + amax * tau)
 
-        self.obs_buf = torch.cat(
+        obs_buf = torch.cat(
             [
                 # Task (heading frame): dim=30 for K=5
                 torch.clamp(self.payload_pos_err * pos_scale, -1.0, 1.0).flatten(1), # (N, 3K), [p0x, p0y, p0z, ..., ]
@@ -483,7 +523,7 @@ class SlungPayloadControlEnv:
             axis=1
         )
 
-        self.priv_obs_buf = self.domain_rand.priviledged_obs()
+        return obs_buf
 
     def _update_crash_conditions(self):
         payload_up_z = -self.payload_proj_g[:, 2]

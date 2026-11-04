@@ -78,5 +78,11 @@ def quat_between(src, dst):
     q = torch.where(flip.unsqueeze(-1), q_flip, q)
     return q / q.norm(dim=-1, keepdim=True)
 
+def perturb_quat(q, dtheta, dim=-1, keepdim=False):
+    angle = torch.norm(dtheta, dim=dim, keepdim=keepdim)
+    half = 0.5 * angle
+    s = torch.where(angle > 1e-9, torch.sin(half) / angle.clamp(min=1e-9), torch.full_like(angle, 0.5)) # sin(a/2) / a
+    return quat_mul(q, torch.cat([torch.cos(half), s * dtheta], dim=dim))
+
 def wrap_pi(a):
     return torch.remainder(a + math.pi, 2.0 * math.pi) - math.pi
