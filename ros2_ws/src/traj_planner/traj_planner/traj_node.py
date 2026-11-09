@@ -15,12 +15,16 @@ class TrajectoryNode(Node):
         self.qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE)
         self.pub = self.create_publisher(PolyTrajectoryMsg, "planner/trajectory", self.qos)
 
+        self.solver = MinSnapSolver()
+
     def publish_trajectory():
         msg = PolyTrajectoryMsg()
 
     def _build_traj():
         ...
 
+    def _load_params(self):
+        ...
 
 
 

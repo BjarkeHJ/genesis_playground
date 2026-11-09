@@ -28,7 +28,7 @@ class RouteSampler:
             v_des = rng.uniform(self.cfg.route_vel_des_min, self.cfg.route_vel_des_max)
             try:
                 meta = {"keyword": keyword}
-                return Route(wpts, v_des, self.cfg.corridor, self.cfg.a_max, self.cfg.traj_max_segments, meta)
+                return Route(wpts, v_des, self.cfg.a_max, self.cfg.corridor, self.cfg.traj_max_segments, meta)
             except ValueError:
                 continue
 

@@ -8,7 +8,7 @@ THETA_STRAIGHT = math.radians(2.0) # below: pass straight through the waypoint
 THETA_STOP = math.radians(170.0) # above: full stop at the waypoint
 
 class Route:
-    def __init__(self, waypoints, v_des, corridor, a_max, max_segments=None, meta=None):
+    def __init__(self, waypoints, v_des, a_max, corridor, max_segments=None, meta=None):
         self.v_des = v_des
         self.a_max = a_max
         self.corridor = corridor
