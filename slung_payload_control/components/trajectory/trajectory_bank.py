@@ -42,7 +42,7 @@ class TrajectoryBank:
     # ========================== OFFLINE BUILD ==========================
     @staticmethod
     def _init_worker(cfg: TrajectoryConfig):
-        from .route import RouteSampler # imported only when building
+        from .route_sampler import RouteSampler # imported only when building
         from .min_snap_solver import MinSnapSolver
         TrajectoryBank._worker.update(cfg=cfg, sampler=RouteSampler(cfg), solver=MinSnapSolver())
     
