@@ -36,6 +36,14 @@ source activate_venv.sh
 python workspace/examples/cable_testing/test_sim.py
 ```
 
+### Usage (b)
+When using the ROS2 workspace ensure ROS2 is installed and venv is deactivated.
+To deactivate run
+```
+deactivate
+```
+
+
 ## Force reinstallation
 To force a reinstallation, simply delete the virtual environment and re-build it. 
 ```

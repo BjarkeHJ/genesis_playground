@@ -5,7 +5,7 @@ from rsl_rl.runners import OnPolicyRunner
 
 from spc_env import SlungPayloadControlEnv
 from config.paths import MODELS_DIR
-from config.config_env import EnvConfig, TrainConfig 
+from config import EnvConfig, TrainConfig 
 
 from slung_payload_control.utils.config_helpers import dataclass_to_dict, dict_to_dataclass, save_yaml, load_yaml, resolve_ckpt
 
