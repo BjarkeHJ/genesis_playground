@@ -8,8 +8,10 @@ TRAJ_BANK_DIR = os.path.join(DATA_DIR, "traj") # data/traj
 
 MODELS_DIR = os.path.join(SPC_DIR, "models") # models/
 
-DRONE_PATH = os.path.join(REPO_ROOT, "system_model", "Starling2MaxURDF", "model", "starling2max.urdf")
-PAYLOAD_PATH = os.path.join(REPO_ROOT, "system_model", "payload", "box", "box.urdf")
+# DRONE_PATH = os.path.join(REPO_ROOT, "system_model", "Starling2MaxURDF", "model", "starling2max.urdf")
+# PAYLOAD_PATH = os.path.join(REPO_ROOT, "system_model", "payload", "box", "box.urdf")
+DRONE_PATH = os.path.join(SPC_DIR, "vehicle", "starling2max", "models", "starling2max_tether", "model.urdf")
+PAYLOAD_PATH = os.path.join(SPC_DIR, "vehicle", "starling2max", "models", "starling2max_tether", "payload.urdf")
 
 if __name__ == "__main__":
     print("================= paths.py entries =================")

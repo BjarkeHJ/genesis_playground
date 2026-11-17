@@ -20,8 +20,10 @@ class FlightController:
         self.att_ctrl = QCAttitudeController(num_envs, sim_dt, device, dtype)
         self.rate_ctrl = QCRateController(num_envs, cfg.n_rotors, sim_dt, device, dtype)
 
-        # Hover collective is airframe independent (see MotorOutput.setpoint_for_thrust_fraction)
-        self.hover_thrust = self.rate_ctrl.thrust_setpoint_for_thrust_fraction(1.0 / cfg.twr_max)
+        # Hover collective depends on the bound airframe's thrust-to-weight: filled in place by bind(). Tensors, so the
+        # torch.compile'd policy_step (compiled before bind) reads the bound value
+        # self.hover_thrust = self.rate_ctrl.thrust_setpoint_for_thrust_fraction(1.0 / cfg.twr_max)
+        self.hover_thrust = torch.zeros((), device=device, dtype=dtype)
         self.min_cos_tilt = math.cos(cfg.tilt_comp_max)
         self.reset_sp = torch.tensor([self.hover_thrust, 0.0, 0.0, 0.0], device=device, dtype=dtype)
         self.prev_sp = self.reset_sp.repeat(num_envs, 1) # [thrust, roll, pitch, yaw rate] of the last policy step
@@ -49,6 +51,10 @@ class FlightController:
 
     def bind(self, airframe: Airframe):
         self.rate_ctrl.bind(airframe.rotors, airframe.rpm_max)
+        self.hover_thrust.fill_(self.rate_ctrl.thrust_setpoint_for_thrust_fraction(1.0 / airframe.twr_max))
+        self.reset_sp[0] = self.hover_thrust
+        self.prev_sp[:] = self.reset_sp
+        print(f"[FlightController] twr_max={airframe.twr_max:.2f}, hover_thrust={self.hover_thrust.item():.3f}")
 
     def reset(self, envs_idx, quat):
         # Hover setpoint and spinning motors, yaw setpoint at the current heading (quat: (len(envs_idx), 4) wxyz)

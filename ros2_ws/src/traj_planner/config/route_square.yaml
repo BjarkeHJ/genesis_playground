@@ -1,0 +1,12 @@
+# traj_planner/config/route_square.yaml
+trajectory_planner_node:
+  ros__parameters:
+    frame_id: "world"
+    desired_velocity: 2.0
+    waypoints: [
+      0.0, 0.0, 2.0,
+      10.0, 0.0, 2.0, 
+      10.0, 10.0, 2.5,
+      0.0, 10.0, 2.0,
+      0.0, 0.0, 2.0
+    ]

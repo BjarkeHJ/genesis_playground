@@ -312,7 +312,7 @@ class QCRateController:
         return self.motors.step(u)
 
     def thrust_setpoint_for_thrust_fraction(self, f):
-        # eg hover: f = weight / (n_rotors * max_motor_thrust) = 1 / twr_max
+        # eg hover: f = weight / (n_rotors * max_motor_thrust) = 1 / airframe.twr_max
         return self.motors.setpoint_for_thrust_fraction(f)
 
     def reset(self, envs_idx, thrust_sp: float = 0.0, rates=None):

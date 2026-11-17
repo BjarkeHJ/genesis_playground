@@ -8,7 +8,8 @@ from dataclasses import dataclass
 class FlightControllerConfig:
     n_rotors: int = 4 # must match the bound airframe
     clip_values: float = 1.0 # clip action values
-    twr_max: float = 2.5 # thrust to weight ratio at full throttle (drone + payload)
+    # twr_max: float = 2.5 # thrust to weight ratio at full throttle (drone + payload)
+    max_rot_velocity: float = 1000.0 # [rad/s] max rotor speed
     max_throttle: float = 1.0 # collective thrust setpoint cap [0, 1]
     max_tilt: float = math.radians(30.0) # roll/pitch setpoint bounds [rad]
     max_yaw_rate: float = math.radians(45.0) # yaw-rate setpoint range [rad/s]

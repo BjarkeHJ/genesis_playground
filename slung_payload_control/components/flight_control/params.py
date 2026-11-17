@@ -37,7 +37,8 @@ class RateControlParams:
 @dataclass(frozen=True)
 class MotorPlantParams:
     # ESC + motor model (From hardware)
-    rpm_min_frac: float = 0.0 # rpm at cmd = 0.0
+    # rpm_min_frac: float = 0.0 # rpm at cmd = 0.0
+    rpm_min_frac: float = 0.15 # rpm at cmd = 0.0
     tau_up: float = 0.0125 # [s] spin-up time constant
     tau_down: float = 0.025 # [s] spin-down time constant
 

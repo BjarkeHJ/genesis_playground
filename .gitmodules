@@ -10,3 +10,10 @@
 [submodule "external/rsl_rl"]
 	path = external/rsl_rl
 	url = https://github.com/leggedrobotics/rsl_rl.git
+[submodule "ros2_ws/src/px4_msgs"]
+	path = ros2_ws/src/px4_msgs
+	url = https://github.com/PX4/px4_msgs.git
+	branch = release/1.17
+[submodule "slung_payload_control/vehicle/starling2max"]
+	path = slung_payload_control/vehicle/starling2max
+	url = https://github.com/BjarkeHJ/AIRLAB_Starling2Max.git

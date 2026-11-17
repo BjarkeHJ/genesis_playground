@@ -19,10 +19,10 @@ def silence_asset_warnings():
     if not any(isinstance(f, AssetLogFilter) for f in gs.logger._logger.filters):
         gs.logger.addFilter(AssetLogFilter())
 
-def airframe_from_genesis(drone, twr_max, payload_mass=0.0):
+def airframe_from_genesis(drone, max_rot_velocity, payload_mass=0.0):
     # Built Genesis drone -> Airframe for FlightController.bind (nominal values, read from env 0).
     # Rotors: propeller positions about the drone's center of mass in body FRD (allocator convention), yaw moment ratio
-    # signed by spin. rpm_max: the rpm at which all rotors together lift twr_max times the drone + payload_mass weight
+    # signed by spin. rpm_max: the motor's top speed; twr_max follows from it, KF and the drone + payload_mass weight
     base = drone.base_link_idx - drone.link_start
     com = drone.get_links_pos([base], ref=gs.link_ref_frame.root_COM)[0, 0]
     props = drone.get_links_pos(drone.propellers_idx - drone.link_start)[0]
@@ -34,5 +34,8 @@ def airframe_from_genesis(drone, twr_max, payload_mass=0.0):
 
     gravity = abs(drone.scene.sim.options.gravity[2])
     total_mass = drone.get_mass().flatten()[0].item() + payload_mass
-    max_motor_thrust = twr_max * total_mass * gravity / drone.n_propellers
-    return Airframe(rotors=rotors, rpm_max=math.sqrt(max_motor_thrust / drone.KF))
+    rpm_max = max_rot_velocity * 60.0 / (2.0 * math.pi) # KF is per rpm^2
+    twr_max = drone.n_propellers * drone.KF * rpm_max**2 / (total_mass * gravity)
+    # max_motor_thrust = twr_max * total_mass * gravity / drone.n_propellers
+    return Airframe(rotors=rotors, rpm_max=rpm_max, twr_max=twr_max)
+    # return Airframe(rotors=rotors, rpm_max=math.sqrt(max_motor_thrust / drone.KF))

@@ -196,7 +196,12 @@ class SlungPayloadControlEnv:
         self.mass0 = torch.zeros(2, device=self.device, dtype=gs.tc_float).index_add_(0, self.mass_links_entity, self.mass_links0)
 
         # Bind DroneEntity to controller
-        self.controller.bind(airframe_from_genesis(self.drone, self.cfg.fc_cfg.twr_max, payload_mass=self.mass0[1].item()))
+        # self.controller.bind(airframe_from_genesis(self.drone, self.cfg.fc_cfg.twr_max, payload_mass=self.mass0[1].item()))
+        self.controller.bind(airframe_from_genesis(
+            drone=self.drone, 
+            max_rot_velocity=self.cfg.fc_cfg.max_rot_velocity, 
+            payload_mass=self.mass0[1].item())
+        )
         # Bind domain randomization
         self.domain_rand.bind(self._apply_domain_rand)
 

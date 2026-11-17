@@ -13,3 +13,4 @@ class Airframe:
     # Everything the flight controller needs from the simulated vehicle (see utils.genesis_helpers.airframe_from_genesis)
     rotors: tuple[Rotor, ...]
     rpm_max: float # rpm at full actuator setpoint
+    twr_max: float # thrust-to-weight at full throttle (drone + payload - derived from rpm_max, KF and mass)

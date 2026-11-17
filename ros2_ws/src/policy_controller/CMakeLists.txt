@@ -27,6 +27,8 @@ set(NODE_NAME policy_controller_node)
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(px4_msgs)
 find_package(Eigen3 REQUIRED)
 
 # Custom msg pkg
@@ -46,6 +48,8 @@ add_executable(
 ament_target_dependencies(
   ${NODE_NAME}
   rclcpp
+  nav_msgs
+  px4_msgs
   policy_interfaces
 )
     
